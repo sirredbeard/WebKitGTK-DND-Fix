@@ -1,0 +1,165 @@
+# Every 4 hours (and manual): if the repo is idle, reboot Vultr + Azure so
+# kernel/sysctl/docker/runner drop-ins take effect, then delete THIS workflow
+# and squash main to a single commit (no Co-authored-by).
+#
+# Retries on the cron until idle once; after a successful reboot cycle the
+# workflow file is removed so it does not keep rebooting forever.
+#
+# Vultr API only from Azure static IP — reboot Vultr via Azure Run Command.
+name: Reboot runners when idle
+
+on:
+  schedule:
+    - cron: "20 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Reboot even if other runs look busy (dangerous)
+        type: boolean
+        default: false
+
+concurrency:
+  group: reboot-runners-when-idle
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  reboot-if-idle:
+    name: Idle check, reboot both, self-delete + squash
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+            scripts/gha-squash-main.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Abort if other workflows are running
+        id: idle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "FORCE=true; skipping idle gate"
+            echo "idle=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          extra=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=30" \
+            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"pending\" or .status == \"waiting\") | {id, name, status}]")
+          echo "other_runs=${extra}"
+          count=$(echo "$extra" | jq 'length')
+          if [[ "$count" -gt 0 ]]; then
+            echo "Repo not idle ($count other runs); skip until next cron."
+            echo "idle=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          busy=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runners" --jq '[.runners[]|select(.busy==true)|.name]|join(",")' 2>/dev/null || echo "")
+          if [[ -n "$busy" ]]; then
+            echo "Runners busy: $busy — skip"
+            echo "idle=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "IDLE_OK"
+          echo "idle=true" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login
+        if: steps.idle.outputs.idle == 'true'
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Ensure Azure up, reboot Vultr via Azure egress, reboot Azure
+        id: reboot
+        if: steps.idle.outputs.idle == 'true'
+        env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "600"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+          RG="${AZURE_RG}"
+          VM="${AZURE_VM_NAME}"
+
+          echo "Requesting Vultr reboot via Azure Run Command (allowlisted egress)"
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts 'set -euo pipefail
+          EXPECTED_IP=20.127.61.97
+          EGRESS=$(curl -4 -fsS --max-time 15 ifconfig.me | tr -d "[:space:]" || true)
+          echo "egress=$EGRESS"
+          test "$EGRESS" = "$EXPECTED_IP"
+          if [[ -f /etc/webkit-dnd/vultr.env ]]; then set -a; source /etc/webkit-dnd/vultr.env; set +a; fi
+          export VULTR_API_KEY="${VULTR_API_KEY:-$(cat /root/.config/vultr/api_key 2>/dev/null || true)}"
+          ID="${VULTR_INSTANCE_ID:-3f9688ab-29c8-440a-a13e-ad6ded14792d}"
+          if ! command -v vultr-cli >/dev/null; then echo "no vultr-cli"; exit 0; fi
+          if vultr-cli instance get "$ID" >/tmp/vi.txt 2>&1; then
+            echo "rebooting vultr $ID"
+            vultr-cli instance reboot "$ID" 2>/dev/null || vultr-cli instance restart "$ID" 2>/dev/null || true
+            head -20 /tmp/vi.txt || true
+          else
+            echo "vultr instance gone — skip reboot"
+            cat /tmp/vi.txt || true
+          fi
+          if [[ -x /usr/local/sbin/host-tune-ubuntu-runner.sh ]]; then
+            FORCE_RESTART=0 /usr/local/sbin/host-tune-ubuntu-runner.sh || true
+          fi
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity || true
+          ' --query 'value[0].message' -o tsv | tail -50
+
+          echo "Rebooting Azure VM so kernel/sysctl/docker drop-ins apply"
+          az vm restart -g "$RG" -n "$VM" --no-wait
+          for i in $(seq 1 40); do
+            p=$(az vm get-instance-view -g "$RG" -n "$VM" \
+              --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" -o tsv 2>/dev/null || true)
+            echo "azure power=$p try=$i"
+            [[ "$p" == *"running"* ]] && (( i > 2 )) && break
+            sleep 15
+          done
+          sleep 60
+          ./scripts/azure-vm-wake.sh || true
+          echo "done=true" >> "$GITHUB_OUTPUT"
+
+      - name: Delete this workflow and squash main to one commit
+        if: steps.reboot.outputs.done == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DELETE_PATHS: .github/workflows/reboot-runners-when-idle.yml
+          SQUASH_MESSAGE: |
+            Private WebKitGTK DnD validation CI and dual-runner burn infra
+
+            Single-commit private validation tree after idle dual-runner reboot
+            (sysctl/docker/runner drop-ins applied).
+        run: |
+          set -euo pipefail
+          chmod +x scripts/gha-squash-main.sh
+          ./scripts/gha-squash-main.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Reboot runners when idle"
+            echo "- idle: \`${{ steps.idle.outputs.idle }}\`"
+            echo "- reboot done: \`${{ steps.reboot.outputs.done }}\`"
+            echo "- on success: workflow self-deleted + main force-squashed to 1 commit"
+          } >> "$GITHUB_STEP_SUMMARY"

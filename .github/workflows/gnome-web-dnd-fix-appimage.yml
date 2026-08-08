@@ -1,0 +1,816 @@
+# Build GNOME Web AppImage against patched WebKitGTK for private manual QA.
+# Reuses a prior WebKitGTK prefix artifact when provided (no full engine rebuild).
+# Dual self-hosted pool (webkit-dnd); pin with runner_label if unit build is on the other host.
+# workflow_dispatch only. Private minutes.
+name: GNOME Web DnD fix AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_repository:
+        description: WebKit git repository (owner/name or URL)
+        type: string
+        default: sirredbeard/WebKit
+      webkit_ref:
+        description: Branch, tag, or SHA on the WebKit repository
+        type: string
+        default: gtk-dnd-file-access-reenable
+      image_tag:
+        description: Date tag YYYYMMDD under ghcr.io/<owner>/webkitgtk-dnd-fix-builder (empty = newest date tag)
+        type: string
+        default: ""
+      gnome_web_ref:
+        description: GNOME Web git ref (gitlab.gnome.org/GNOME/epiphany)
+        type: string
+        default: main
+      webkit_prefix_artifact_run_id:
+        description: Actions run id with webkitgtk-prefix-* artifact (empty = auto-find latest, else build)
+        type: string
+        default: ""
+      force_rebuild_prefix:
+        description: Ignore cached prefix artifacts and rebuild WebKitGTK install
+        type: boolean
+        default: false
+      publish_release:
+        description: Attach AppImage to a private validation GitHub Release
+        type: boolean
+        default: true
+      runner_label:
+        description: Pin runner (any | azure | vultr). Prefer azure (64G) for full prefix builds
+        type: choice
+        options:
+          - any
+          - azure
+          - vultr
+        default: azure
+      warm_from_peer:
+        description: Pull ccache from peer before prefix/AppImage build
+        type: boolean
+        default: true
+      skip_wake:
+        description: Skip Azure wake (parent already woke)
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      webkit_repository:
+        type: string
+        default: sirredbeard/WebKit
+      webkit_ref:
+        type: string
+        default: gtk-dnd-file-access-reenable
+      image_tag:
+        type: string
+        default: ""
+      gnome_web_ref:
+        type: string
+        default: main
+      webkit_prefix_artifact_run_id:
+        type: string
+        default: ""
+      force_rebuild_prefix:
+        type: boolean
+        default: false
+      publish_release:
+        type: boolean
+        default: true
+      runner_label:
+        type: string
+        default: vultr
+      warm_from_peer:
+        type: boolean
+        default: true
+      skip_wake:
+        type: boolean
+        default: false
+
+# Own concurrency group so this can run beside unit builds on the other host.
+# Per-run group; unit lane can occupy the other host at the same time.
+concurrency:
+  group: gnome-web-dnd-fix-appimage-${{ github.ref }}-${{ github.run_id }}-${{ inputs.runner_label || 'any' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+  actions: write
+
+env:
+  IMAGE_NAME: webkitgtk-dnd-fix-builder
+  WEBKIT_CLONE_DIR: ${{ github.workspace }}/WebKit
+  OUT_DIR: ${{ github.workspace }}/out
+  CCACHE_DIR: /var/cache/webkit-dnd/ccache
+  PREFIX_CACHE: /var/cache/webkit-dnd/prefix
+  CCACHE_MAXSIZE: 40G
+  PREFIX_HOST: /var/cache/webkit-dnd/prefix
+
+jobs:
+  wake-azure:
+    name: Wake Azure runner if needed
+    if: ${{ inputs.runner_label != 'vultr' && inputs.skip_wake != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+          sparse-checkout-cone-mode: false
+      - name: Start VM and wait for runner online
+        env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "720"
+        run: |
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+  appimage:
+    name: Fedora 44 WebKitGTK + GNOME Web AppImage
+    needs: wake-azure
+    if: ${{ always() && (needs.wake-azure.result == 'success' || needs.wake-azure.result == 'skipped' || (inputs.runner_label == 'any' && needs.wake-azure.result != 'cancelled')) }}
+    runs-on: ${{ inputs.runner_label == 'azure' && fromJSON('["self-hosted","linux","x64","webkit-dnd","azure"]') || inputs.runner_label == 'vultr' && fromJSON('["self-hosted","linux","x64","webkit-dnd","vultr"]') || fromJSON('["self-hosted","linux","x64","webkit-dnd"]') }}
+    timeout-minutes: 480
+    steps:
+      - name: Runner prep (persistent dirs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ env.CCACHE_DIR }}" "${{ env.PREFIX_HOST }}" "${{ env.OUT_DIR }}"
+          echo "host=$(hostname) nproc=$(nproc) mem=$(free -h | awk '/^Mem:/{print $2}')"
+          docker version
+          df -h / /var/cache/webkit-dnd 2>/dev/null || df -h /
+          if ! docker image inspect "ghcr.io/sirredbeard/${{ env.IMAGE_NAME }}:20260808" >/dev/null 2>&1; then
+            SEED=$(ls -1 /var/cache/webkit-dnd/images/${{ env.IMAGE_NAME }}-*.tar.zst 2>/dev/null | sort | tail -1 || true)
+            if [[ -n "${SEED}" ]]; then
+              zstd -dc "${SEED}" | docker load || true
+            fi
+          fi
+
+      - name: Reclaim root-owned workspace leftovers
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          WS="${{ github.workspace }}"
+          sudo -n chown -R "$(id -u):$(id -g)" "${WS}" 2>/dev/null || true
+          sudo -n find "${WS}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+          sudo -n find "${WS}" -type f -name '*.pyc' -delete 2>/dev/null || true
+          exit 0
+
+      - name: Checkout validation repo
+        uses: actions/checkout@v4
+        with:
+          path: WebKitGTK-DND-Fix
+          sparse-checkout: |
+            scripts
+            containers
+            html
+          sparse-checkout-cone-mode: true
+
+      - name: Install sync scripts + warm ccache/prefix handoff
+        if: ${{ inputs.warm_from_peer != false }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/warm-ccache-from-peer.sh /usr/local/sbin/warm-ccache-from-peer.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-peer-sync.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-cache-sync.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/ccache-live-sync.sh /usr/local/sbin/ccache-live-sync.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/seed-prefix-from-last-good.sh /usr/local/sbin/seed-prefix-from-last-good.sh
+          # ~5 min ccache + quick last-good prefix tarball from fattest peer
+          sudo WARM_TIMEOUT_SEC=300 WARM_PREFIX=1 WARM_MIRRORS=0 /usr/local/sbin/warm-ccache-from-peer.sh
+          exit 0
+
+      - name: Resolve inputs
+        id: vars
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.webkit_repository }}"
+          REF="${{ inputs.webkit_ref }}"
+          TAG="${{ inputs.image_tag }}"
+          OWNER="${{ github.repository_owner }}"
+          PREFIX_RUN="${{ inputs.webkit_prefix_artifact_run_id }}"
+          if [[ "${REPO}" != http* ]]; then
+            REPO_URL="https://github.com/${REPO}.git"
+          else
+            REPO_URL="${REPO}"
+          fi
+          if [[ -z "${TAG}" ]]; then
+            TAG="$(
+              gh api --paginate \
+                "/users/${OWNER}/packages/container/${IMAGE_NAME}/versions" \
+                --jq '[.[].metadata.container.tags[]?] | map(select(test("^[0-9]{8}$"))) | sort | reverse | .[0] // empty' \
+                2>/dev/null || true
+            )"
+            if [[ -z "${TAG}" ]]; then
+              TAG="$(date -u +%Y%m%d)"
+              echo "No date tags found on GHCR yet; falling back to ${TAG}"
+            else
+              echo "Resolved newest date tag: ${TAG}"
+            fi
+          fi
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}:${TAG}"
+          REUSE=false
+          if [[ -n "${PREFIX_RUN}" ]]; then
+            REUSE=true
+          fi
+          DAY="$(date -u +%Y%m%d)"
+          {
+            echo "repo_url=${REPO_URL}"
+            echo "ref=${REF}"
+            echo "tag=${TAG}"
+            echo "image=${IMAGE}"
+            echo "day=${DAY}"
+            echo "gnome_web_ref=${{ inputs.gnome_web_ref }}"
+            echo "publish=${{ inputs.publish_release }}"
+            echo "reuse_prefix=${REUSE}"
+            echo "prefix_run=${PREFIX_RUN}"
+            echo "force_rebuild=${{ inputs.force_rebuild_prefix }}"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p "${{ env.OUT_DIR }}" "${{ env.CCACHE_DIR }}" "${{ env.PREFIX_HOST }}"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image and update WebKit (parallel, local caches)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.vars.outputs.image }}"
+          REPO_URL="${{ steps.vars.outputs.repo_url }}"
+          REF="${{ steps.vars.outputs.ref }}"
+          OUT="${{ env.OUT_DIR }}"
+          CLONE_DIR="${{ env.WEBKIT_CLONE_DIR }}"
+          mkdir -p "${OUT}" /var/cache/webkit-dnd/mirrors /var/cache/webkit-dnd/images
+          # Drop root-owned leftovers from prior container runs so git clone can replace the tree.
+          if [[ -e "${CLONE_DIR}" ]]; then
+            sudo chmod -R u+w "${CLONE_DIR}" 2>/dev/null || true
+            sudo rm -rf "${CLONE_DIR}" 2>/dev/null || rm -rf "${CLONE_DIR}" || true
+          fi
+
+          (
+            set -euo pipefail
+            echo "pull ${IMAGE}"
+            if ! docker pull "${IMAGE}"; then
+              SEED=$(ls -1t /var/cache/webkit-dnd/images/webkitgtk-dnd-fix-builder-*.tar.zst 2>/dev/null | head -1 || true)
+              if [[ -n "${SEED}" ]]; then
+                echo "ghcr pull failed; loading local seed ${SEED}"
+                zstd -dc "${SEED}" | docker load
+                docker image inspect "${IMAGE}" >/dev/null
+              else
+                exit 1
+              fi
+            fi
+            docker image inspect "${IMAGE}" >/dev/null
+          ) >"${OUT}/docker-pull.log" 2>&1 &
+          pull_pid=$!
+
+          (
+            set -euo pipefail
+            export REPO_URL REF CLONE_DIR OUT_DIR="${OUT}"
+            export MIRROR_DIR=/var/cache/webkit-dnd/mirrors/WebKit.git
+            chmod +x WebKitGTK-DND-Fix/scripts/clone-webkit.sh WebKitGTK-DND-Fix/scripts/clone-from-mirror.sh
+            bash WebKitGTK-DND-Fix/scripts/clone-webkit.sh
+          ) >"${OUT}/git-clone.log" 2>&1 &
+          clone_pid=$!
+
+          pull_rc=0
+          clone_rc=0
+          wait "${pull_pid}" || pull_rc=$?
+          wait "${clone_pid}" || clone_rc=$?
+          if [[ "${pull_rc}" -ne 0 ]]; then
+            tail -n 80 "${OUT}/docker-pull.log" || true
+            echo "::error::Builder image unavailable: ${IMAGE} (docker pull and local seed both failed)."
+            exit 1
+          fi
+          if [[ "${clone_rc}" -ne 0 ]]; then
+            tail -n 80 "${OUT}/git-clone.log" || true
+            echo "::error::WebKit clone failed for ${REPO_URL} @ ${REF} (often stale root-owned files under CLONE_DIR)."
+            exit 1
+          fi
+
+      - name: Seed prefix from host/peer last-good tarball
+        id: hostprefix
+        if: steps.vars.outputs.force_rebuild != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          OUT="${{ env.OUT_DIR }}"
+          DEST="${{ env.PREFIX_HOST }}"
+          CLONE="${{ env.WEBKIT_CLONE_DIR }}"
+          mkdir -p "$OUT" "$DEST"
+          # Pin seed to the WebKit tree we just cloned. Stale last-good (e.g. d5bec)
+          # must not wipe a tip PREFIX or pack the wrong engine.
+          EXP=""
+          if [[ -d "${CLONE}/.git" ]]; then
+            EXP="$(git -C "${CLONE}" rev-parse HEAD 2>/dev/null | tr -cd '0-9a-f' | head -c 40 || true)"
+          fi
+          echo "expected_webkit_sha=${EXP:-<none>}" | tee "$OUT/prefix-seed-expected.txt"
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/seed-prefix-from-last-good.sh /usr/local/sbin/seed-prefix-from-last-good.sh
+          if sudo env PREFIX_HOST="$DEST" OUT_DIR="$OUT" EXPECTED_WEBKIT_SHA="${EXP}" \
+              /usr/local/sbin/seed-prefix-from-last-good.sh; then
+            if [[ -e "$DEST/lib64/pkgconfig/webkitgtk-6.0.pc" || -e "$DEST/lib/pkgconfig/webkitgtk-6.0.pc" ]]; then
+              STAMP="$(tr -cd '0-9a-f' <"$DEST/.webkitgtk-dnd-sha" 2>/dev/null | head -c 40 || true)"
+              if [[ -n "${EXP}" && -n "${STAMP}" && "${STAMP}" != "${EXP}"* && "${EXP}" != "${STAMP}"* ]]; then
+                echo "prefix_ready=false" >> "$GITHUB_OUTPUT"
+                echo "seed stamp ${STAMP} != expected ${EXP}" | tee -a "$OUT/prefix-reuse.log"
+                exit 0
+              fi
+              echo "prefix_ready=true" >> "$GITHUB_OUTPUT"
+              echo "seeded stamp=${STAMP} expected=${EXP}" | tee "$OUT/prefix-reuse.log"
+              exit 0
+            fi
+          fi
+          echo "prefix_ready=false" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Resolve and download WebKitGTK prefix artifact
+        id: dlprefix
+        if: steps.vars.outputs.force_rebuild != 'true' && steps.hostprefix.outputs.prefix_ready != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${{ env.OUT_DIR }}"
+          DEST="${{ env.PREFIX_HOST }}"
+          mkdir -p "${OUT}/prefix-dl" "${DEST}"
+          RUN_ID="${{ steps.vars.outputs.prefix_run }}"
+          SHORT_SHA="$(git -C "${{ env.WEBKIT_CLONE_DIR }}" rev-parse --short=12 HEAD 2>/dev/null || true)"
+          chmod +x WebKitGTK-DND-Fix/scripts/find-latest-webkit-prefix-artifact.sh || true
+
+          if [[ -z "${RUN_ID}" ]]; then
+            # Auto-find newest webkitgtk-prefix artifact, prefer name containing this SHA.
+            line="$(WebKitGTK-DND-Fix/scripts/find-latest-webkit-prefix-artifact.sh "${SHORT_SHA}" 2>"${OUT}/prefix-find.err" || true)"
+            if [[ -z "${line}" || "${line}" == none* ]]; then
+              line="$(WebKitGTK-DND-Fix/scripts/find-latest-webkit-prefix-artifact.sh 2>>"${OUT}/prefix-find.err" || true)"
+            fi
+            ART_NAME=""
+            if [[ -n "${line}" && "${line}" != none* ]]; then
+              RUN_ID="$(echo "${line}" | awk -F'\t' '{print $1}')"
+              ART_NAME="$(echo "${line}" | awk -F'\t' '{print $2}')"
+              echo "auto-selected run=${RUN_ID} artifact=${ART_NAME}" | tee "${OUT}/prefix-reuse.log"
+            fi
+          fi
+
+          if [[ -z "${RUN_ID}" || "${RUN_ID}" == "0" ]]; then
+            echo "no prefix artifact available; will build" | tee -a "${OUT}/prefix-reuse.log"
+            exit 1
+          fi
+
+          if [[ -n "${ART_NAME:-}" ]]; then
+            gh run download "${RUN_ID}" -n "${ART_NAME}" -D "${OUT}/prefix-dl" || {
+              echo "download failed for run ${RUN_ID} name ${ART_NAME}"
+              exit 1
+            }
+          else
+            gh run download "${RUN_ID}" -D "${OUT}/prefix-dl" || {
+              echo "download failed for run ${RUN_ID}"
+              exit 1
+            }
+          fi
+          TARBALL="$(find "${OUT}/prefix-dl" -type f \( -name 'webkitgtk-prefix-*.tar.zst' -o -name 'webkitgtk-prefix-*.tar.gz' \) | head -1 || true)"
+          if [[ -z "${TARBALL}" ]]; then
+            TARBALL="$(find "${OUT}/prefix-dl" -type f \( -name '*.tar.zst' -o -name '*.tar.gz' \) | head -1 || true)"
+          fi
+          [[ -n "${TARBALL}" ]] || { echo "no prefix tarball in run ${RUN_ID}"; exit 1; }
+          echo "Extract ${TARBALL}"
+          if [[ "${TARBALL}" == *.zst ]]; then
+            tar -C "${DEST}" -I zstd -xf "${TARBALL}"
+          else
+            tar -C "${DEST}" -xzf "${TARBALL}"
+          fi
+          # Sanity: pkg-config file or lib present
+          if [[ ! -e "${DEST}/lib64/pkgconfig/webkitgtk-6.0.pc" && ! -e "${DEST}/lib/pkgconfig/webkitgtk-6.0.pc" ]]; then
+            echo "extracted prefix missing webkitgtk-6.0.pc" | tee -a "${OUT}/prefix-reuse.log"
+            exit 1
+          fi
+          echo "prefix_ready=true" >> "$GITHUB_OUTPUT"
+          echo "reused_prefix_run=${RUN_ID}" | tee -a "${OUT}/prefix-reuse.log"
+
+
+      - name: Start mid-build ccache live-sync
+        if: ${{ inputs.warm_from_peer != false && (steps.vars.outputs.force_rebuild == 'true' || steps.hostprefix.outputs.prefix_ready != 'true') }}
+        continue-on-error: true
+        run: |
+          set +e
+          sudo LIVE_SYNC_INTERVAL_SEC=180 /usr/local/sbin/ccache-live-sync.sh start || true
+          exit 0
+
+      - name: Build WebKitGTK install prefix in container
+        id: prefix
+        if: steps.vars.outputs.force_rebuild == 'true' || (steps.hostprefix.outputs.prefix_ready != 'true' && steps.dlprefix.outcome != 'success')
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.vars.outputs.image }}"
+          docker run --rm \
+            --name webkitgtk-dnd-prefix \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_MAXSIZE=${{ env.CCACHE_MAXSIZE }} \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_BASEDIR=/workspace/WebKit \
+            -e CCACHE_NOHASHDIR=true \
+            -e CCACHE_DEPEND=true \
+            -e WEBKIT_DIR=/workspace/WebKit \
+            -e BUILD_DIR=/workspace/WebKit/build-gtk-install \
+            -e OUT_DIR=/out \
+            -e PREFIX=/opt/webkitgtk-dnd \
+            -e MAKE_TARBALL=1 \
+            -e JOBS="$(nproc)" \
+            -v "${{ env.WEBKIT_CLONE_DIR }}:/workspace/WebKit:rw" \
+            -v "${{ env.CCACHE_DIR }}:/ccache:rw" \
+            -v "${{ env.OUT_DIR }}:/out:rw" \
+            -v "${{ env.PREFIX_HOST }}:/opt/webkitgtk-dnd:rw" \
+            -v "${{ github.workspace }}/WebKitGTK-DND-Fix/scripts:/validation-scripts:ro" \
+            -v "/var/cache/webkit-dnd/mirrors:/var/cache/webkit-dnd/mirrors:ro" \
+            -v "/var/cache/webkit-dnd/tools:/tools:ro" \
+            -w /workspace \
+            "${IMAGE}" \
+            bash /validation-scripts/ci-build-webkitgtk-prefix.sh \
+            2>&1 | tee "${{ env.OUT_DIR }}/docker-prefix.log"
+          if [[ ! -e "${{ env.PREFIX_HOST }}/lib64/pkgconfig/webkitgtk-6.0.pc" && ! -e "${{ env.PREFIX_HOST }}/lib/pkgconfig/webkitgtk-6.0.pc" ]]; then
+            echo "prefix build finished without webkitgtk-6.0.pc" >&2
+            exit 1
+          fi
+          echo "prefix_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Snapshot prefix build-tree on failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/build-tree-snapshot.sh /usr/local/sbin/build-tree-snapshot.sh 2>/dev/null || true
+          # prefix container uses host path under workspace or cache - try common locations
+          for d in /var/cache/webkit-dnd/build-gtk-install \
+                   "${{ github.workspace }}/WebKit/build-gtk-install"; do
+            if [[ -f "$d/build.ninja" ]]; then
+              sudo MODE=save-push SNAP_NAME=build-gtk-install BUILD_HOST_DIR="$d" \
+                /usr/local/sbin/build-tree-snapshot.sh || true
+              break
+            fi
+          done
+
+      - name: Stop live-sync after prefix (keep ccache flowing)
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          sudo /usr/local/sbin/ccache-live-sync.sh stop || true
+          exit 0
+
+      - name: Build GNOME Web AppImage in container
+        id: build
+        if: steps.hostprefix.outputs.prefix_ready == 'true' || steps.dlprefix.outcome == 'success' || steps.prefix.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.vars.outputs.image }}"
+          mkdir -p /var/cache/webkit-dnd/epiphany-src /var/cache/webkit-dnd/epiphany-build
+          # Clear stale epiphany tree (may be root-owned from prior container)
+          sudo rm -rf /var/cache/webkit-dnd/epiphany-src /var/cache/webkit-dnd/epiphany-build 2>/dev/null || true
+          mkdir -p /var/cache/webkit-dnd/epiphany-src /var/cache/webkit-dnd/epiphany-build
+          sudo chown -R "$(id -u):$(id -g)" /var/cache/webkit-dnd/epiphany-src /var/cache/webkit-dnd/epiphany-build 2>/dev/null || true
+          docker run --rm \
+            --name webkitgtk-dnd-gnome-web-appimage \
+            --device /dev/fuse \
+            --cap-add SYS_ADMIN \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_MAXSIZE=${{ env.CCACHE_MAXSIZE }} \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_BASEDIR=/workspace/WebKit \
+            -e CCACHE_NOHASHDIR=true \
+            -e WEBKIT_DIR=/workspace/WebKit \
+            -e EPIPHANY_DIR=/workspace/epiphany \
+            -e EPIPHANY_BUILD=/workspace/gnome-web-build \
+            -e OUT_DIR=/out \
+            -e PREFIX=/opt/webkitgtk-dnd \
+            -e SKIP_WEBKIT_BUILD=1 \
+            -e DISSOCIATE=1 \
+            -e EPIPHANY_REF="${{ steps.vars.outputs.gnome_web_ref }}" \
+            -e JOBS="$(nproc)" \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            -v "${{ env.WEBKIT_CLONE_DIR }}:/workspace/WebKit:rw" \
+            -v /var/cache/webkit-dnd/epiphany-src:/workspace/epiphany:rw \
+            -v /var/cache/webkit-dnd/epiphany-build:/workspace/gnome-web-build:rw \
+            -v "${{ env.CCACHE_DIR }}:/ccache:rw" \
+            -v "${{ env.OUT_DIR }}:/out:rw" \
+            -v "${{ env.PREFIX_HOST }}:/opt/webkitgtk-dnd:rw" \
+            -v "${{ github.workspace }}/WebKitGTK-DND-Fix/scripts:/validation-scripts:ro" \
+            -v "/var/cache/webkit-dnd/mirrors:/var/cache/webkit-dnd/mirrors:ro" \
+            -v "/var/cache/webkit-dnd/tools:/tools:ro" \
+            -v "${{ github.workspace }}/WebKitGTK-DND-Fix/html:/workspace/WebKitGTK-DND-Fix/html:ro" \
+            -w /workspace \
+            "${IMAGE}" \
+            bash /validation-scripts/ci-build-gnome-web-appimage.sh \
+            2>&1 | tee "${{ env.OUT_DIR }}/docker-appimage.log"
+
+      - name: Smoke-test AppImage in clean Fedora 44 container
+        if: success()
+        shell: bash
+        env:
+          OUT_DIR: ${{ env.OUT_DIR }}
+          EXPECTED_WEBKIT_SHA: ${{ steps.vars.outputs.short_sha || '' }}
+        run: |
+          set -euo pipefail
+          chmod +x WebKitGTK-DND-Fix/scripts/ci-smoke-appimage.sh
+          AI="$(find "${{ env.OUT_DIR }}" -maxdepth 1 -type f -name '*.AppImage' | head -1 || true)"
+          [[ -n "${AI}" ]] || { echo "no AppImage to smoke-test"; exit 1; }
+          # Engine pin: PREFIX stamp first, then webkit-sha.txt, never gnome-web-head.
+          EXPECTED_WEBKIT_SHA=""
+          if [[ -f "${{ env.PREFIX_HOST }}/.webkitgtk-dnd-sha" ]]; then
+            EXPECTED_WEBKIT_SHA="$(tr -cd '0-9a-f' <"${{ env.PREFIX_HOST }}/.webkitgtk-dnd-sha" | head -c 40)"
+          fi
+          if [[ -z "${EXPECTED_WEBKIT_SHA}" && -f "${{ env.OUT_DIR }}/webkit-sha.txt" ]]; then
+            EXPECTED_WEBKIT_SHA="$(tr -cd '0-9a-f' <"${{ env.OUT_DIR }}/webkit-sha.txt" | head -c 40)"
+          fi
+          if [[ -z "${EXPECTED_WEBKIT_SHA}" && -d "${{ env.WEBKIT_CLONE_DIR }}/.git" ]]; then
+            EXPECTED_WEBKIT_SHA="$(git -C "${{ env.WEBKIT_CLONE_DIR }}" rev-parse HEAD | tr -cd '0-9a-f' | head -c 40)"
+          fi
+          # Reject accidental epiphany SHA if gnome-web-head matches
+          if [[ -f "${{ env.OUT_DIR }}/gnome-web-head.txt" && -n "${EXPECTED_WEBKIT_SHA}" ]]; then
+            GNOME_SHA="$(head -1 "${{ env.OUT_DIR }}/gnome-web-head.txt" | tr -cd '0-9a-f' | head -c 40)"
+            if [[ -n "${GNOME_SHA}" && "${EXPECTED_WEBKIT_SHA}" == "${GNOME_SHA}" ]]; then
+              echo "warn: webkit sha collided with gnome-web; falling back to clone HEAD"
+              EXPECTED_WEBKIT_SHA="$(git -C "${{ env.WEBKIT_CLONE_DIR }}" rev-parse HEAD | tr -cd '0-9a-f' | head -c 40)"
+            fi
+          fi
+          export EXPECTED_WEBKIT_SHA
+          echo "smoke expected_webkit_sha=${EXPECTED_WEBKIT_SHA:-<any>}"
+          docker pull fedora:44
+          OUT_DIR="${{ env.OUT_DIR }}" EXPECTED_WEBKIT_SHA="${EXPECTED_WEBKIT_SHA:-}" \
+            bash WebKitGTK-DND-Fix/scripts/ci-smoke-appimage.sh "${AI}"
+          tee -a "$GITHUB_STEP_SUMMARY" <"${{ env.OUT_DIR }}/appimage-smoke.log" >/dev/null || true
+
+      - name: Upload WebKitGTK prefix artifact for reuse
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          # Name must start with webkitgtk-prefix for auto-discovery.
+          name: webkitgtk-prefix-${{ github.sha }}
+          path: |
+            ${{ env.OUT_DIR }}/webkitgtk-prefix-*.tar.zst
+            ${{ env.OUT_DIR }}/webkitgtk-prefix-*.tar.gz
+            ${{ env.OUT_DIR }}/webkit-sha.txt
+            ${{ env.OUT_DIR }}/webkit-prefix-summary.log
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+
+      - name: Reclaim workspace after docker (avoid checkout Post EACCES)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          chmod +x WebKitGTK-DND-Fix/scripts/workspace-fix-root-owned.sh 2>/dev/null || true
+          bash WebKitGTK-DND-Fix/scripts/workspace-fix-root-owned.sh "${{ github.workspace }}" || true
+          exit 0
+
+      - name: Pack log bundle (best effort)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          OUT="${{ env.OUT_DIR }}"
+          mkdir -p "${OUT}/bundle"
+          for f in \
+            appimage-summary.log \
+            appimage-environment.log \
+            appimage-ls.txt \
+            webkit-head.txt \
+            webkit-sha.txt \
+            gnome-web-head.txt \
+            webkitgtk-pc-version.txt \
+            webkit-prefix-summary.log \
+            webkit-prefix-environment.log \
+            webkit-prefix-tarball-ls.txt \
+            webkit-cmake.tail.log \
+            webkit-ninja-install.tail.log \
+            webkit-ninja-install.fail.tail.log \
+            webkit-ninja-install.log.zst \
+            gnome-web-meson.tail.log \
+            gnome-web-ninja.tail.log \
+            linuxdeploy.tail.log \
+            linuxdeploy.log \
+            appimagetool.log \
+            docker-pull.log \
+            git-clone.log \
+            docker-prefix.log \
+            docker-appimage.log \
+            prefix-reuse.log \
+            ccache-after-prefix-build.log
+          do
+            [[ -f "${OUT}/${f}" ]] && cp -a "${OUT}/${f}" "${OUT}/bundle/" || true
+          done
+          # keep last ~2MB of huge docker logs
+          for big in docker-prefix.log docker-appimage.log; do
+            if [[ -f "${OUT}/bundle/${big}" ]]; then
+              tail -c 2000000 "${OUT}/bundle/${big}" >"${OUT}/bundle/${big%.log}.tail.log" || true
+              rm -f "${OUT}/bundle/${big}"
+            fi
+          done
+          if command -v zstd >/dev/null 2>&1; then
+            (cd "${OUT}/bundle" && tar -I 'zstd -19' -cf "${OUT}/appimage-logs.tar.zst" .) || true
+          fi
+          (cd "${OUT}/bundle" && tar -czf "${OUT}/appimage-logs.tar.gz" .) || true
+          # Always leave a marker so upload has something
+          date -u >"${OUT}/bundle-status.txt" || true
+          ls -la "${OUT}" >"${OUT}/out-listing.txt" || true
+          exit 0
+
+      - name: Publish validation GitHub Release with AppImage
+        if: success() && steps.vars.outputs.publish == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${{ env.OUT_DIR }}"
+          DAY="${{ steps.vars.outputs.day }}"
+          PRETTY="$(date -u +%Y-%m-%d)"
+          TAG="validation-${DAY}-gnome-web"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            TAG="validation-${DAY}-gnome-web-${{ github.run_id }}"
+          fi
+          mkdir -p "${OUT}/release"
+          APPIMAGE="$(find "${OUT}" -maxdepth 1 -type f -name '*.AppImage' | head -1 || true)"
+          [[ -n "${APPIMAGE}" ]] || { echo "No AppImage to publish"; exit 1; }
+          cp -a "${APPIMAGE}" "${OUT}/release/"
+          for f in appimage-logs.tar.zst appimage-logs.tar.gz appimage-summary.log webkit-head.txt gnome-web-head.txt; do
+            [[ -f "${OUT}/${f}" ]] && cp -a "${OUT}/${f}" "${OUT}/release/" || true
+          done
+          if [[ -d WebKitGTK-DND-Fix/html ]]; then
+            (cd WebKitGTK-DND-Fix && zip -qr "${OUT}/release/html-harness.zip" html) || true
+          fi
+          # Builder glibc floor: AppImages link against the build host's glibc. Older
+          # distros with a lower glibc will fail at load with GLIBC_x.y not found.
+          GLIBC_VER=""
+          if [[ -f "${OUT}/builder-glibc.txt" ]]; then
+            GLIBC_VER="$(tr -d '[:space:]' <"${OUT}/builder-glibc.txt" | head -c 32)"
+          fi
+          if [[ -z "${GLIBC_VER}" ]]; then
+            GLIBC_VER="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)"
+          fi
+          GLIBC_VER="${GLIBC_VER:-2.43}"
+          WEBKIT_SHA=""
+          [[ -f "${OUT}/webkit-sha.txt" ]] && WEBKIT_SHA="$(tr -d '[:space:]' <"${OUT}/webkit-sha.txt" | head -c 40)"
+          [[ -z "${WEBKIT_SHA}" && -f "${{ env.PREFIX_HOST }}/.webkitgtk-dnd-sha" ]] && \
+            WEBKIT_SHA="$(tr -d '[:space:]' <"${{ env.PREFIX_HOST }}/.webkitgtk-dnd-sha" | head -c 40)"
+          GNOME_SHA=""
+          [[ -f "${OUT}/gnome-web-head.txt" ]] && GNOME_SHA="$(head -1 "${OUT}/gnome-web-head.txt" | tr -d '[:space:]' | head -c 40)"
+          {
+            echo "GNOME Web AppImage validation ${PRETTY} (UTC)."
+            echo ""
+            echo "Built on Fedora 44 against patched WebKitGTK. Private validation only."
+            echo "Not an upstream GNOME or WebKit release. Not for Flathub."
+            echo ""
+            echo "### Runtime requirements"
+            echo ""
+            echo "- Arch: x86_64"
+            echo "- Builder OS: Fedora 44"
+            echo "- Minimum glibc: ${GLIBC_VER} (from the Fedora 44 builder)."
+            echo "- Cross-distro note: AppImage portability is usually limited by glibc,"
+            echo "  not by missing shared libs. Hosts with glibc older than ${GLIBC_VER}"
+            echo "  will fail at startup (GLIBC_x.y not found). Fedora 44+ and other"
+            echo "  distros with glibc >= ${GLIBC_VER} are the intended targets."
+            echo "- Needs a working GUI session (Wayland or X11) for real DnD QA."
+            echo "- CLI check: ./GNOME_Web-WebKitGTK-DnD-x86_64.AppImage --version"
+            echo "  prints Web <epiphany-shortrev>. That alone does not prove the migrator"
+            echo "  or GUI path; open the app once for a real smoke."
+            echo ""
+            echo "### Build pins"
+            echo ""
+            echo "- workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- image: \`${{ steps.vars.outputs.image }}\`"
+            echo "- webkit: \`${{ steps.vars.outputs.repo_url }}\` @ \`${{ steps.vars.outputs.ref }}\`${WEBKIT_SHA:+ (${WEBKIT_SHA})}"
+            echo "- gnome-web ref: \`${{ steps.vars.outputs.gnome_web_ref }}\`${GNOME_SHA:+ (${GNOME_SHA})}"
+            echo "- prefix reuse requested: \`${{ steps.vars.outputs.reuse_prefix }}\`"
+            echo "- builder glibc: ${GLIBC_VER}"
+            echo ""
+            echo "### Manual QA"
+            echo ""
+            echo "1. chmod +x the AppImage and run it (GUI)."
+            echo "2. Confirm profile migrator does not abort (no /opt/webkitgtk-dnd path errors)."
+            echo "3. Open the HTML harness from this release (or bundled under share/webkitgtk-dnd-fix/html)."
+            echo "4. External file drop from Files into layer2 / an upload UI: files should populate."
+            echo "5. Layer1 web uri-list attack page: no file contents."
+            echo "6. Layer4 local drag/export: no surprise file grant."
+            echo "7. File picker still works."
+          } > "${OUT}/release/notes.md"
+          assets=()
+          while IFS= read -r -d '' f; do
+            assets+=("$f")
+          done < <(find "${OUT}/release" -maxdepth 1 -type f ! -name notes.md -print0)
+          gh release create "${TAG}" \
+            --title "GNOME Web DnD fix AppImage ${PRETTY}" \
+            --notes-file "${OUT}/release/notes.md" \
+            "${assets[@]}"
+          echo "Published ${TAG}"
+
+      - name: Upload AppImage, prefix tarball, and logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnome-web-appimage-${{ github.run_id }}
+          path: |
+            ${{ env.OUT_DIR }}/*.AppImage
+            ${{ env.OUT_DIR }}/webkitgtk-prefix-*.tar.zst
+            ${{ env.OUT_DIR }}/webkitgtk-prefix-*.tar.gz
+            ${{ env.OUT_DIR }}/appimage-logs.tar.zst
+            ${{ env.OUT_DIR }}/appimage-logs.tar.gz
+            ${{ env.OUT_DIR }}/appimage-summary.log
+            ${{ env.OUT_DIR }}/summary.log
+            ${{ env.OUT_DIR }}/webkit-prefix-summary.log
+            ${{ env.OUT_DIR }}/selectiondata-tests.log
+            ${{ env.OUT_DIR }}/docker-prefix.log
+            ${{ env.OUT_DIR }}/docker-appimage.log
+            ${{ env.OUT_DIR }}/out-listing.txt
+            ${{ env.OUT_DIR }}/bundle-status.txt
+            ${{ env.OUT_DIR }}/*.tail.log
+            ${{ env.OUT_DIR }}/*.log
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+      - name: Prune old Actions artifacts
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set +e
+          chmod +x WebKitGTK-DND-Fix/scripts/prune-actions-artifacts.sh
+          WebKitGTK-DND-Fix/scripts/prune-actions-artifacts.sh 5 || true
+          exit 0
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GNOME Web AppImage"
+            echo ""
+            echo "- image: \`${{ steps.vars.outputs.image }}\`"
+            echo "- webkit: \`${{ steps.vars.outputs.repo_url }}\` @ \`${{ steps.vars.outputs.ref }}\`"
+            echo "- gnome-web: \`${{ steps.vars.outputs.gnome_web_ref }}\`"
+            echo "- prefix step: \`${{ steps.prefix.conclusion }}\`"
+            echo "- appimage step: \`${{ steps.build.conclusion }}\`"
+            echo "- prefix reuse: \`${{ steps.vars.outputs.reuse_prefix }}\`"
+            echo ""
+            echo "### AppImage"
+            echo '```'
+            cat "${{ env.OUT_DIR }}/appimage-ls.txt" 2>/dev/null || ls -lh "${{ env.OUT_DIR }}"/*.AppImage 2>/dev/null || true
+            echo '```'
+            echo "### Summary"
+            echo '```'
+            cat "${{ env.OUT_DIR }}/appimage-summary.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Background peer cache sync (non-blocking)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          if [[ -x /usr/local/sbin/webkit-dnd-peer-sync.sh ]]; then
+            sudo systemd-run --unit=webkit-dnd-peer-sync-job-$RANDOM --collect --nice=10               /usr/local/sbin/webkit-dnd-peer-sync.sh ||               sudo nohup /usr/local/sbin/webkit-dnd-peer-sync.sh >>/var/cache/webkit-dnd/out/peer-sync.log 2>&1 & true
+          fi
+          exit 0

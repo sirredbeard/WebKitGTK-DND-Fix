@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layer 4: local drag and export</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+  #src, #dst { border: 2px dashed #333; padding: 2rem; margin: 1rem 0; }
+  #src { background: #ffe8e8; }
+  #dst { background: #e8f7ff; min-height: 4rem; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+</style>
+<h1>Layer 4: IsSource deny + export sanitize</h1>
+<h2>A. In-page drag</h2>
+<p>Drag red to blue. Same as layer 1 plus IsSource should deny even if filenames
+were somehow present.</p>
+<div id="src" draggable="true">Drag me (file:// uri-list)</div>
+<div id="dst">Drop here (same page)</div>
+<h2>B. Export to file manager</h2>
+<p>Drag the red box to Nautilus. <strong>Pass:</strong> no new file created from
+<code>/etc/passwd</code> and the drag should not look like a real file offer.
+Non-file URL drags can still work from other pages.</p>
+<div id="log"></div>
+<script>
+const log = (msg, cls) => {
+  document.getElementById('log').innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+};
+document.getElementById('src').addEventListener('dragstart', (e) => {
+  e.dataTransfer.setData('text/uri-list', 'file:///etc/passwd');
+  e.dataTransfer.setData('text/plain', 'file:///etc/passwd');
+  e.dataTransfer.effectAllowed = 'copyMove';
+});
+const dst = document.getElementById('dst');
+dst.addEventListener('dragover', (e) => e.preventDefault());
+dst.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const files = e.dataTransfer.files;
+  log('local drop files.length=' + files.length);
+  if (files.length === 0)
+    log('PASS: local/web drag did not grant File objects', 'pass');
+  else
+    log('FAIL: local drag granted files', 'fail');
+});
+</script>

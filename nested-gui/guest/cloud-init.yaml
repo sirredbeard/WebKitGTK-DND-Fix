@@ -1,0 +1,27 @@
+#cloud-config
+hostname: dnd-gui
+users:
+  - name: dnd
+    groups: [wheel, kvm]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+# set password at image build time
+package_update: true
+packages:
+  - gnome-session
+  - gnome-shell
+  - nautilus
+  - xdg-desktop-portal
+  - xdg-desktop-portal-gnome
+  - at-spi2-core
+  - python3-pyatspi
+  - jq
+  - strace
+  - lsof
+  - qemu-guest-agent
+  - fuse
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - gsettings set org.gnome.desktop.session idle-delay 0 || true
+  - gsettings set org.gnome.desktop.screensaver lock-enabled false || true

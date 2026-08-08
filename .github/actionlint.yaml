@@ -1,0 +1,9 @@
+self-hosted-runner:
+  labels:
+    - webkit-dnd
+    - vultr
+    - azure
+    - fedora-44
+    - ubuntu-24.04
+    - Linux
+    - X64

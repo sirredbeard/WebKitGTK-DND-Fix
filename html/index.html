@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebKitGTK DnD layer validation</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 1.5rem; }
+  a { display: block; margin: 0.4rem 0; }
+  code { background: #f4f4f4; padding: 0.1rem 0.3rem; }
+</style>
+<h1>WebKitGTK DnD fix validation</h1>
+<p>Open each case in MiniBrowser built from the fix branch. Automated coverage is the SelectionData gtest run in CI; use these pages for manual desktop checks only.</p>
+<ol>
+  <li><a href="layer1-web-uri-list-no-files.html">Layer 1: web uri-list must not create files</a></li>
+  <li><a href="layer2-external-drop-files.html">Layer 2: external file drop may create files</a></li>
+  <li><a href="layer3-portal-notes.html">Layer 3: portal / GdkFileList notes</a></li>
+  <li><a href="layer4-local-drag-and-export.html">Layer 4: local drag deny + export sanitize</a></li>
+</ol>

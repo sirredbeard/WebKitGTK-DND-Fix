@@ -1,0 +1,183 @@
+# After the short Vultr burn window: github-hosted MUST wake Azure first.
+# vultr-cli runs only on the Azure VM so API calls egress from the reserved
+# static public IP (20.127.61.97) which is on the Vultr user IP allowlist.
+# Never call Vultr API from github-hosted runners (ephemeral IPs are blocked).
+#
+# After success: delete this workflow file and squash main to one commit.
+# Always: one disk snapshot (stable description), wait until complete, then
+# delete the instance. Snapshots cost storage — never mint a second one.
+name: Vultr snapshot and delete
+
+on:
+  schedule:
+    # ~5 days after initial provision (UTC). Safe to re-run; no-op if already deleted.
+    - cron: "50 3 13 8 *"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type delete to run destructive teardown
+        type: string
+        default: ""
+
+concurrency:
+  group: vultr-teardown
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  wake-azure:
+    name: Wake Azure via github-hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Guard manual runs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm != 'delete' }}
+        run: |
+          echo "Manual teardown requires confirm=delete"
+          exit 1
+      - uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+            scripts/webkit-dnd-vultr-snapshot-delete.sh
+          sparse-checkout-cone-mode: false
+      - env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "900"
+        run: |
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+  snapshot-delete:
+    name: One snapshot then delete Vultr
+    needs: wake-azure
+    runs-on: [self-hosted, linux, x64, webkit-dnd, azure]
+    timeout-minutes: 180
+    steps:
+      - name: Hold awake + activity
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/webkit-dnd /var/cache/webkit-dnd/out
+          echo "$$" | sudo tee /etc/webkit-dnd/MAINTENANCE_LOCK >/dev/null
+          echo "$$" | sudo tee /etc/webkit-dnd/HOLD_AWAKE >/dev/null
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+
+      - name: Install teardown script from repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/webkit-dnd-vultr-snapshot-delete.sh
+            scripts/webkit-dnd-peer-sync.sh
+            scripts/warm-ccache-from-peer.sh
+            scripts/gha-squash-main.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Ensure vultr-cli + static egress IP
+        run: |
+          set -euo pipefail
+          command -v vultr-cli
+          test -f /etc/webkit-dnd/vultr.env || test -f /root/.config/vultr/api_key
+          sudo install -m 755 scripts/webkit-dnd-vultr-snapshot-delete.sh /usr/local/sbin/webkit-dnd-vultr-snapshot-delete.sh
+          EXPECTED_IP="${AZURE_STATIC_IP:-20.127.61.97}"
+          EGRESS=$(curl -4 -fsS --max-time 15 ifconfig.me || curl -4 -fsS --max-time 15 icanhazip.com || true)
+          EGRESS=$(echo "$EGRESS" | tr -d '[:space:]')
+          echo "egress_ip=${EGRESS} expected=${EXPECTED_IP}"
+          if [[ "${EGRESS}" != "${EXPECTED_IP}" ]]; then
+            echo "Refusing Vultr API: egress ${EGRESS:-unknown} is not static allowlisted IP ${EXPECTED_IP}" >&2
+            exit 1
+          fi
+          sudo bash -c 'set -a; source /etc/webkit-dnd/vultr.env 2>/dev/null || export VULTR_API_KEY=$(cat /root/.config/vultr/api_key); set +a; vultr-cli account info' | head -5
+
+      - name: Final peer sync before Vultr dies
+        continue-on-error: true
+        run: |
+          set +e
+          sudo install -m 755 scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-peer-sync.sh 2>/dev/null || true
+          sudo install -m 755 scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-cache-sync.sh 2>/dev/null || true
+          sudo install -m 755 scripts/warm-ccache-from-peer.sh /usr/local/sbin/warm-ccache-from-peer.sh 2>/dev/null || true
+          sudo env SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh || true
+          sudo PEER_HOSTS=155.138.194.251 WARM_TIMEOUT_SEC=600 WARM_PREFIX=1 WARM_IMAGES=1 /usr/local/sbin/warm-ccache-from-peer.sh || true
+          exit 0
+
+      - name: One snapshot of Vultr disk, then delete VPS
+        run: |
+          set -euo pipefail
+          EXPECTED_IP="${AZURE_STATIC_IP:-20.127.61.97}"
+          EGRESS=$(curl -4 -fsS --max-time 15 ifconfig.me | tr -d '[:space:]')
+          [[ "${EGRESS}" == "${EXPECTED_IP}" ]] || { echo "egress changed to ${EGRESS}"; exit 1; }
+          # Always snapshot-then-delete. Script refuses a second snapshot and
+          # refuses delete until that single snapshot is complete.
+          sudo AZURE_STATIC_IP="${EXPECTED_IP}" \
+            VULTR_INSTANCE_ID=3f9688ab-29c8-440a-a13e-ad6ded14792d \
+            VULTR_SNAPSHOT_DESC=webkit-dnd-gha-final \
+            /usr/local/sbin/webkit-dnd-vultr-snapshot-delete.sh
+
+      - name: Remove teardown workflow + squash main to one commit
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DELETE_PATHS: .github/workflows/vultr-teardown.yml
+          SQUASH_MESSAGE: |
+            Private WebKitGTK DnD validation CI and dual-runner burn infra
+
+            Single-commit tree after Vultr snapshot+delete. Burn-window Vultr
+            teardown workflow removed; Azure runner and shared CI remain.
+        run: |
+          set -euo pipefail
+          # Prefer repo script; fall back to fetching from current workspace checkout
+          if [[ ! -f scripts/gha-squash-main.sh ]]; then
+            sudo -u gha git -C "${{ github.workspace }}" fetch origin main 2>/dev/null || true
+          fi
+          # Checkout full scripts on the azure runner workspace
+          cd "${{ github.workspace }}"
+          if [[ ! -f scripts/gha-squash-main.sh ]]; then
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}"               -H "Accept: application/vnd.github.raw"               "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/scripts/gha-squash-main.sh?ref=main"               -o /tmp/gha-squash-main.sh || true
+            if [[ -s /tmp/gha-squash-main.sh ]]; then
+              chmod +x /tmp/gha-squash-main.sh
+              /tmp/gha-squash-main.sh
+              exit 0
+            fi
+          fi
+          chmod +x scripts/gha-squash-main.sh
+          ./scripts/gha-squash-main.sh
+
+      - name: Clear locks
+        if: always()
+        run: |
+          sudo rm -f /etc/webkit-dnd/MAINTENANCE_LOCK /etc/webkit-dnd/HOLD_AWAKE
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Vultr teardown"
+            echo "- path: one snapshot (webkit-dnd-gha-final) then delete"
+            echo "- ran on: $(hostname)"
+            echo "- stamp:"
+            echo '```'
+            sudo cat /var/cache/webkit-dnd/out/vultr-teardown-done 2>/dev/null || echo "(not done)"
+            sudo cat /var/cache/webkit-dnd/out/vultr-teardown-snapshot-id 2>/dev/null || true
+            echo '```'
+            echo "- log tail:"
+            echo '```'
+            sudo tail -n 50 /var/log/webkit-dnd-vultr-snapshot-delete.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

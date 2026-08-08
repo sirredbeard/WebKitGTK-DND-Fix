@@ -1,0 +1,182 @@
+# Maximize the short dual-runner burn window: up to two heavy jobs at once.
+#
+# Default split (one job per self-hosted runner):
+#   Lane A Azure 64G: WebKitGTK unit build + SelectionData tests
+#   Lane B Vultr 32G: GNOME Web AppImage from last-good prefix (no engine rebuild)
+#
+# Free pool: set unit_runner/appimage_runner to "any" and GitHub places each job on
+# an idle webkit-dnd host. Per-run concurrency groups never cancel sibling work.
+# Warm + live ccache + prefix tarball + image seed let a job resume on the other host.
+#
+name: Parallel burn (unit + AppImage)
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_repository:
+        type: string
+        default: sirredbeard/WebKit
+      webkit_ref:
+        type: string
+        default: gtk-dnd-file-access-reenable
+      image_tag:
+        type: string
+        default: ""
+      unit_runner:
+        description: Where to run unit build/test
+        type: choice
+        options: [azure, vultr, any]
+        default: azure
+      appimage_runner:
+        description: Where to run AppImage/prefix lane
+        type: choice
+        options: [vultr, azure, any]
+        default: vultr
+      skip_appimage:
+        type: boolean
+        default: false
+      skip_unit:
+        type: boolean
+        default: false
+
+concurrency:
+  group: parallel-burn-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+  actions: write
+
+jobs:
+  wake-azure:
+    name: Wake Azure (both lanes may need it)
+    if: ${{ inputs.unit_runner != 'vultr' || inputs.appimage_runner != 'vultr' || inputs.skip_appimage == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+          sparse-checkout-cone-mode: false
+      - env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "720"
+        run: |
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+  # Fast ccache nudge before lanes fork. Azure only if wake succeeded (avoid queue forever).
+  pre-warm-azure:
+    name: Pre-warm ccache on Azure
+    needs: wake-azure
+    if: ${{ always() && needs.wake-azure.result == 'success' }}
+    runs-on: [self-hosted, linux, x64, webkit-dnd, azure]
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Warm ccache from peer
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          sudo WARM_TIMEOUT_SEC=300 WARM_PREFIX=1 /usr/local/sbin/warm-ccache-from-peer.sh 2>/dev/null || \
+            sudo env SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh || true
+          exit 0
+
+  pre-warm-vultr:
+    name: Pre-warm ccache on Vultr
+    needs: wake-azure
+    if: ${{ always() && needs.wake-azure.result != 'cancelled' }}
+    runs-on: [self-hosted, linux, x64, webkit-dnd, vultr]
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Warm ccache from peer
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          sudo WARM_TIMEOUT_SEC=300 WARM_PREFIX=1 /usr/local/sbin/warm-ccache-from-peer.sh 2>/dev/null || \
+            sudo env SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh || true
+          exit 0
+
+  unit-lane:
+    name: Unit build + SelectionData (lane A)
+    # Only wait for Azure pre-warm so lane B is not a gate; unit re-warms itself too.
+    needs: [wake-azure, pre-warm-azure]
+    if: ${{ always() && inputs.skip_unit == false && (needs.wake-azure.result == 'success' || needs.wake-azure.result == 'skipped' || inputs.unit_runner != 'azure') }}
+    # Re-use the existing workflow for the real steps (single source of truth).
+    uses: ./.github/workflows/webkit-gtk-dnd.yml
+    secrets: inherit
+    with:
+      webkit_repository: ${{ inputs.webkit_repository }}
+      webkit_ref: ${{ inputs.webkit_ref }}
+      image_tag: ${{ inputs.image_tag }}
+      ninja_targets: TestWebCore
+      gtest_filter: SelectionData.*
+      allow_local_image_build: false
+      runner_label: ${{ inputs.unit_runner }}
+      warm_from_peer: true
+      skip_wake: true
+
+  appimage-lane:
+    name: AppImage / prefix (lane B)
+    # Only wait for Vultr pre-warm; can pack AppImage from last-good while unit builds on Azure.
+    needs: [wake-azure, pre-warm-vultr]
+    if: ${{ always() && inputs.skip_appimage == false && (needs.wake-azure.result == 'success' || needs.wake-azure.result == 'skipped' || inputs.appimage_runner != 'azure') }}
+    uses: ./.github/workflows/gnome-web-dnd-fix-appimage.yml
+    secrets: inherit
+    with:
+      webkit_repository: ${{ inputs.webkit_repository }}
+      webkit_ref: ${{ inputs.webkit_ref }}
+      image_tag: ${{ inputs.image_tag }}
+      runner_label: ${{ inputs.appimage_runner }}
+      warm_from_peer: true
+      skip_wake: true
+      force_rebuild_prefix: false
+      publish_release: true
+
+  post-sync-azure:
+    name: Final peer sync on Azure
+    needs: [wake-azure, unit-lane, appimage-lane]
+    if: ${{ always() && needs.wake-azure.result == 'success' }}
+    runs-on: [self-hosted, linux, x64, webkit-dnd, azure]
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          sudo env SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh || true
+          exit 0
+
+  post-sync-vultr:
+    name: Final peer sync on Vultr
+    needs: [unit-lane, appimage-lane]
+    if: always()
+    runs-on: [self-hosted, linux, x64, webkit-dnd, vultr]
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          sudo env SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh || true
+          exit 0

@@ -1,0 +1,254 @@
+# Manually build and publish the Fedora 44 WebKitGTK dependency image.
+# Image tags are UTC date only (YYYYMMDD).
+# After push, peer hourly sync + optional docker save keeps both runners warm.
+name: Build deps container
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push image to ghcr.io
+        type: boolean
+        default: true
+      tag_extra:
+        description: Optional extra tag in addition to the UTC date tag
+        type: string
+        required: false
+        default: ""
+      runner_label:
+        description: Pin runner (any | azure | vultr)
+        type: choice
+        options:
+          - any
+          - azure
+          - vultr
+        default: any
+
+concurrency:
+  group: build-deps-container-${{ github.ref }}-${{ inputs.runner_label || 'any' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+env:
+  # GHCR requires lowercase image names. Human title: WebKitGTK-DND-Fix-builder.
+  IMAGE_NAME: webkitgtk-dnd-fix-builder
+  CACHE_SCOPE: webkitgtk-dnd-fix-builder
+
+jobs:
+  wake-azure:
+    name: Wake Azure runner if needed
+    if: ${{ inputs.runner_label != 'vultr' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+          sparse-checkout-cone-mode: false
+      - name: Start VM and wait for runner online
+        env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "720"
+        run: |
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+  build-and-push:
+    name: Build Fedora 44 deps image
+    needs: wake-azure
+    if: ${{ always() && (needs.wake-azure.result == 'success' || needs.wake-azure.result == 'skipped' || (inputs.runner_label == 'any' && needs.wake-azure.result != 'cancelled')) }}
+    runs-on: ${{ inputs.runner_label == 'azure' && fromJSON('["self-hosted","linux","x64","webkit-dnd","azure"]') || inputs.runner_label == 'vultr' && fromJSON('["self-hosted","linux","x64","webkit-dnd","vultr"]') || fromJSON('["self-hosted","linux","x64","webkit-dnd"]') }}
+    timeout-minutes: 90
+    steps:
+      - name: Runner prep
+        shell: bash
+        run: |
+          mkdir -p /var/cache/webkit-dnd/buildx-cache /var/cache/webkit-dnd/images
+          echo "host=$(hostname) nproc=$(nproc)"
+          docker version
+          df -h /
+
+      - name: Reclaim root-owned workspace leftovers
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          WS="${{ github.workspace }}"
+          sudo -n chown -R "$(id -u):$(id -g)" "${WS}" 2>/dev/null || true
+          sudo -n find "${WS}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+          sudo -n find "${WS}" -type f -name '*.pyc' -delete 2>/dev/null || true
+          exit 0
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            containers
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Sync bake scripts into containers/
+        run: ./scripts/sync-container-scripts.sh
+
+      - name: UTC date tag
+        id: date
+        run: echo "tag=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Enable BuildKit
+        run: echo "DOCKER_BUILDKIT=1" >> "$GITHUB_ENV"
+
+      - name: Log in to ghcr.io
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.date.outputs.tag }}
+            type=raw,value=${{ inputs.tag_extra }},enable=${{ inputs.tag_extra != '' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./containers
+          file: ./containers/Dockerfile
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=${{ env.CACHE_SCOPE }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: |
+            type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Seed local image tarball for peer runners
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.date.outputs.tag }}"
+          IMG="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${TAG}"
+          mkdir -p /var/cache/webkit-dnd/images
+          # Prefer local tag after build; fall back to pull if only remote
+          docker image inspect "$IMG" >/dev/null 2>&1 || docker pull "$IMG" || true
+          if docker image inspect "$IMG" >/dev/null 2>&1; then
+            OUT="/var/cache/webkit-dnd/images/${{ env.IMAGE_NAME }}-${TAG}.tar.zst"
+            # zstd refuses to overwrite an existing -o target without -f
+            rm -f "$OUT"
+            docker save "$IMG" | zstd -T0 -1 -f -o "$OUT"
+            ls -lh "$OUT"
+          fi
+          # Hourly peer sync fans out images/ccache; mirrors are per-host git fetch
+
+      - name: Prune old GHCR container versions
+        if: ${{ inputs.push && success() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_OWNER: ${{ github.repository_owner }}
+          GHCR_PACKAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/prune-ghcr-container.sh
+          ./scripts/prune-ghcr-container.sh "${GHCR_PACKAGE}" 2 | tee prune-ghcr.log
+
+      - name: Prune old Actions artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/prune-actions-artifacts.sh
+          ./scripts/prune-actions-artifacts.sh 5 || true
+
+      - name: Write build summary
+        if: always()
+        run: |
+          {
+            echo "## Deps container"
+            echo ""
+            echo "- push: \`${{ inputs.push }}\`"
+            echo "- date tag: \`${{ steps.date.outputs.tag }}\`"
+            echo "- tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- prune keep_tagged: 2"
+            if [[ -f prune-ghcr.log ]]; then
+              echo ""
+              echo "### GHCR prune"
+              echo '```'
+              cat prune-ghcr.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure crumbs only
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-build-failure-${{ github.run_id }}
+          path: |
+            prune-ghcr.log
+            containers/Dockerfile
+            containers/packages.txt
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 9
+
+      - name: Reclaim workspace after docker (avoid checkout Post EACCES)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          chmod +x scripts/workspace-fix-root-owned.sh 2>/dev/null || true
+          bash scripts/workspace-fix-root-owned.sh "${{ github.workspace }}" || true
+          exit 0
+
+      - name: Background peer cache sync (non-blocking)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          if [[ -x /usr/local/sbin/webkit-dnd-peer-sync.sh ]]; then
+            sudo systemd-run --unit=webkit-dnd-peer-sync-job-$RANDOM --collect --nice=10               /usr/local/sbin/webkit-dnd-peer-sync.sh ||               sudo nohup /usr/local/sbin/webkit-dnd-peer-sync.sh >>/var/cache/webkit-dnd/out/peer-sync.log 2>&1 & true
+          fi
+          exit 0

@@ -1,0 +1,733 @@
+# Build WebKitGTK from the fix branch and run SelectionData DnD API tests
+# inside the prebuilt Fedora 44 deps container.
+#
+# Dual self-hosted pool (shared label webkit-dnd):
+# - vultr-voc-c-16c-webkit-dnd (Fedora 44 host, 16c/32G)
+# - azure-d16ds-webkit-dnd (Ubuntu 24.04 host, 16c/64G) — builds still use Fedora 44 container
+# Pick any idle runner unless runner_label pins azure or vultr.
+# Hourly peer rsync keeps ccache/prefix/images warm; each host seeds its own git mirrors.
+#
+# Cost controls:
+# - workflow_dispatch only
+# - require GHCR builder image (no silent full image rebuild)
+# - default ninja target TestWebCore only
+# - persistent host ccache + build dir under /var/cache/webkit-dnd
+# - no free-disk-space; no GHA ccache/buildsnap upload tax
+name: WebKitGTK DnD build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_repository:
+        description: WebKit git repository (owner/name or URL)
+        type: string
+        default: sirredbeard/WebKit
+      webkit_ref:
+        description: Branch, tag, or SHA on the WebKit repository
+        type: string
+        default: gtk-dnd-file-access-reenable
+      image_tag:
+        description: Date tag YYYYMMDD under ghcr.io/<owner>/webkitgtk-dnd-fix-builder (empty = newest date tag)
+        type: string
+        default: ""
+      ninja_targets:
+        description: Ninja targets (default TestWebCore only)
+        type: string
+        default: TestWebCore
+      gtest_filter:
+        description: gtest filter for TestWebCore
+        type: string
+        default: SelectionData.*
+      allow_local_image_build:
+        description: If GHCR pull fails, build Dockerfile in-job (expensive)
+        type: boolean
+        default: false
+      runner_label:
+        description: Pin runner (any | azure | vultr). any = first idle webkit-dnd host
+        type: choice
+        options:
+          - any
+          - azure
+          - vultr
+        default: any
+      warm_from_peer:
+        description: Pull ccache from peer host before build (resume after other-host failure)
+        type: boolean
+        default: true
+      skip_wake:
+        description: Skip Azure wake job (parent workflow already woke)
+        type: boolean
+        default: false
+      tests_only:
+        description: Skip configure/build; run gtests + external validation on existing build-gtk (or restored snapshot)
+        type: boolean
+        default: false
+      restore_build_snapshot:
+        description: Pull/restore ninja build-tree snapshot before build/tests
+        type: boolean
+        default: true
+      run_external_validation:
+        description: Run automated HTML/layer external validation after gtests
+        type: boolean
+        default: true
+      snapshot_on_failure:
+        description: Snapshot build-gtk on failure/cancel for peer resume
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      webkit_repository:
+        type: string
+        default: sirredbeard/WebKit
+      webkit_ref:
+        type: string
+        default: gtk-dnd-file-access-reenable
+      image_tag:
+        type: string
+        default: ""
+      ninja_targets:
+        type: string
+        default: TestWebCore
+      gtest_filter:
+        type: string
+        default: SelectionData.*
+      allow_local_image_build:
+        type: boolean
+        default: false
+      runner_label:
+        type: string
+        default: any
+      warm_from_peer:
+        type: boolean
+        default: true
+      skip_wake:
+        type: boolean
+        default: false
+      tests_only:
+        type: boolean
+        default: false
+      restore_build_snapshot:
+        type: boolean
+        default: true
+      run_external_validation:
+        type: boolean
+        default: true
+      snapshot_on_failure:
+        type: boolean
+        default: true
+
+# Separate group from AppImage/container so unit + AppImage can run in parallel on the two hosts.
+# Per-run group so two concurrent dispatches (or unit+other) can occupy both hosts.
+# cancel-in-progress false: never kill a useful in-flight burn.
+concurrency:
+  group: webkit-gtk-dnd-${{ github.ref }}-${{ github.run_id }}-${{ inputs.runner_label || 'any' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+  actions: write
+
+env:
+  IMAGE_NAME: webkitgtk-dnd-fix-builder
+  WEBKIT_CLONE_DIR: ${{ github.workspace }}/WebKit
+  OUT_DIR: ${{ github.workspace }}/out
+  # Persistent on self-hosted box (survives job workspace wipe patterns better than _work alone).
+  CCACHE_DIR: /var/cache/webkit-dnd/ccache
+  BUILD_HOST_DIR: /var/cache/webkit-dnd/build-gtk
+  CCACHE_MAXSIZE: 40G
+
+jobs:
+  # Start Azure when this job might land there. Vultr-only pins skip wake.
+  # Runs on github-hosted so it works even if both self-hosted boxes are asleep.
+  wake-azure:
+    name: Wake Azure runner if needed
+    if: ${{ inputs.runner_label != 'vultr' && inputs.skip_wake != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+          sparse-checkout-cone-mode: false
+      - name: Start VM and wait for runner online
+        env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "720"
+        run: |
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+  build-test:
+    name: Fedora 44 WebKitGTK build + SelectionData tests
+    needs: wake-azure
+    # Skipped wake (vultr pin) is fine. Wake success required for azure pin.
+    # If pin is any and wake fails, still run on remaining online runners (usually Vultr).
+    if: ${{ always() && (needs.wake-azure.result == 'success' || needs.wake-azure.result == 'skipped' || (inputs.runner_label == 'any' && needs.wake-azure.result != 'cancelled')) }}
+    runs-on: ${{ inputs.runner_label == 'azure' && fromJSON('["self-hosted","linux","x64","webkit-dnd","azure"]') || inputs.runner_label == 'vultr' && fromJSON('["self-hosted","linux","x64","webkit-dnd","vultr"]') || fromJSON('["self-hosted","linux","x64","webkit-dnd"]') }}
+    timeout-minutes: 360
+    steps:
+      - name: Runner prep (persistent dirs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ env.CCACHE_DIR }}" "${{ env.BUILD_HOST_DIR }}" "${{ env.OUT_DIR }}"
+          echo "host=$(hostname) nproc=$(nproc) mem=$(free -h | awk '/^Mem:/{print $2}') disk=$(df -h /var/cache/webkit-dnd | tail -1)"
+          docker version
+          ccache -s 2>/dev/null || true
+          df -h / /var/cache/webkit-dnd || df -h /
+          # Prefer local image; load tarball seed if docker image missing
+          if ! docker image inspect "ghcr.io/sirredbeard/${{ env.IMAGE_NAME }}:20260808" >/dev/null 2>&1; then
+            SEED=$(ls -1 /var/cache/webkit-dnd/images/${{ env.IMAGE_NAME }}-*.tar.zst 2>/dev/null | sort | tail -1 || true)
+            if [[ -n "${SEED}" ]]; then
+              echo "docker load from ${SEED}"
+              zstd -dc "${SEED}" | docker load || true
+            fi
+          fi
+          docker images "ghcr.io/sirredbeard/${{ env.IMAGE_NAME }}" --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}' || true
+          ls -la /var/cache/webkit-dnd/mirrors 2>/dev/null || true
+
+      # Docker root bind-mounts leave __pycache__ the runner cannot delete; checkout Post EACCES.
+      - name: Reclaim root-owned workspace leftovers
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          if [[ -x "${{ github.workspace }}/WebKitGTK-DND-Fix/scripts/workspace-fix-root-owned.sh" ]]; then
+            bash "${{ github.workspace }}/WebKitGTK-DND-Fix/scripts/workspace-fix-root-owned.sh" "${{ github.workspace }}" || true
+          else
+            # Pre-checkout: scripts not present yet. Inline best-effort.
+            WS="${{ github.workspace }}"
+            sudo -n chown -R "$(id -u):$(id -g)" "${WS}" 2>/dev/null || true
+            sudo -n find "${WS}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+          fi
+          exit 0
+
+      - name: Checkout validation repo
+        uses: actions/checkout@v4
+        with:
+          path: WebKitGTK-DND-Fix
+          sparse-checkout: |
+            scripts
+            containers
+            html
+          sparse-checkout-cone-mode: true
+
+      - name: Install sync scripts + warm ccache (short block, high payoff)
+        if: ${{ inputs.warm_from_peer != false }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/warm-ccache-from-peer.sh /usr/local/sbin/warm-ccache-from-peer.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-peer-sync.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-cache-sync.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/ccache-live-sync.sh /usr/local/sbin/ccache-live-sync.sh
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/seed-prefix-from-last-good.sh /usr/local/sbin/seed-prefix-from-last-good.sh || true
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/build-tree-snapshot.sh /usr/local/sbin/build-tree-snapshot.sh || true
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/ci-external-validation.sh /usr/local/sbin/ci-external-validation.sh || true
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/ci-write-last-good-unit.sh /usr/local/sbin/ci-write-last-good-unit.sh || true
+          # Block up to ~5 min for ccache from the fattest peer — usually pays for itself in ninja
+          sudo WARM_TIMEOUT_SEC=300 WARM_PREFIX=0 WARM_MIRRORS=0 WARM_IMAGES=1 /usr/local/sbin/warm-ccache-from-peer.sh
+          CCACHE_DIR="${{ env.CCACHE_DIR }}" ccache -s 2>/dev/null | tee "${{ env.OUT_DIR }}/ccache-before-build.log" || true
+          exit 0
+
+
+      - name: Restore build-tree snapshot (resume assist)
+        if: ${{ inputs.restore_build_snapshot != false }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/build-tree-snapshot.sh /usr/local/sbin/build-tree-snapshot.sh 2>/dev/null || true
+          sudo MODE=pull-restore SNAP_NAME=build-gtk-unit BUILD_HOST_DIR="${{ env.BUILD_HOST_DIR }}" \
+            /usr/local/sbin/build-tree-snapshot.sh || true
+          du -sh "${{ env.BUILD_HOST_DIR }}" 2>/dev/null || true
+
+      - name: Resolve inputs
+        id: vars
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.webkit_repository }}"
+          REF="${{ inputs.webkit_ref }}"
+          TAG="${{ inputs.image_tag }}"
+          TARGETS="${{ inputs.ninja_targets }}"
+          FILTER="${{ inputs.gtest_filter }}"
+          ALLOW_LOCAL="${{ inputs.allow_local_image_build }}"
+          OWNER="${{ github.repository_owner }}"
+          if [[ "${REPO}" != http* ]]; then
+            REPO_URL="https://github.com/${REPO}.git"
+          else
+            REPO_URL="${REPO}"
+          fi
+          # Image tags are UTC date only (YYYYMMDD). Empty input -> newest date tag on GHCR.
+          if [[ -z "${TAG}" ]]; then
+            TAG="$(
+              gh api --paginate                 "/users/${OWNER}/packages/container/${IMAGE_NAME}/versions"                 --jq '[.[].metadata.container.tags[]?] | map(select(test("^[0-9]{8}$"))) | sort | reverse | .[0] // empty'                 2>/dev/null || true
+            )"
+            if [[ -z "${TAG}" ]]; then
+              TAG="$(date -u +%Y%m%d)"
+              echo "No date tags found on GHCR yet; falling back to ${TAG}"
+            else
+              echo "Resolved newest date tag: ${TAG}"
+            fi
+          fi
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}:${TAG}"
+          {
+            echo "repo_url=${REPO_URL}"
+            echo "ref=${REF}"
+            echo "tag=${TAG}"
+            echo "image=${IMAGE}"
+            echo "targets=${TARGETS}"
+            echo "filter=${FILTER}"
+            echo "allow_local=${ALLOW_LOCAL}"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p "${{ env.OUT_DIR }}" "${{ env.CCACHE_DIR }}"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Fail-fast path: pull image and clone WebKit at the same time.
+      - name: Pull image and update WebKit (parallel, local caches)
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.vars.outputs.image }}"
+          REPO_URL="${{ steps.vars.outputs.repo_url }}"
+          REF="${{ steps.vars.outputs.ref }}"
+          OUT="${{ env.OUT_DIR }}"
+          CLONE_DIR="${{ env.WEBKIT_CLONE_DIR }}"
+          mkdir -p "${OUT}" /var/cache/webkit-dnd/mirrors /var/cache/webkit-dnd/images
+          if [[ -e "${CLONE_DIR}" ]]; then
+            sudo chmod -R u+w "${CLONE_DIR}" 2>/dev/null || true
+            sudo rm -rf "${CLONE_DIR}" 2>/dev/null || rm -rf "${CLONE_DIR}" || true
+          fi
+
+          pull_rc=0
+          clone_rc=0
+
+          (
+            set -euo pipefail
+            echo "pull ${IMAGE}"
+            # Local docker image cache: first pull stores layers; later pulls are no-ops
+            # until the tag digest changes (new date tag / rebuilt packages).
+            docker pull "${IMAGE}"
+            docker image inspect "${IMAGE}" >/dev/null
+          ) >"${OUT}/docker-pull.log" 2>&1 &
+          pull_pid=$!
+
+          (
+            set -euo pipefail
+            export REPO_URL REF CLONE_DIR OUT_DIR="${OUT}"
+            export MIRROR_DIR=/var/cache/webkit-dnd/mirrors/WebKit.git
+            chmod +x WebKitGTK-DND-Fix/scripts/clone-webkit.sh
+            bash WebKitGTK-DND-Fix/scripts/clone-webkit.sh
+          ) >"${OUT}/git-clone.log" 2>&1 &
+          clone_pid=$!
+
+          if ! wait "${pull_pid}"; then
+            pull_rc=1
+            echo "docker pull failed" | tee -a "${OUT}/prep-errors.log"
+            tail -n 50 "${OUT}/docker-pull.log" || true
+          fi
+          if ! wait "${clone_pid}"; then
+            clone_rc=1
+            echo "git clone failed" | tee -a "${OUT}/prep-errors.log"
+            tail -n 80 "${OUT}/git-clone.log" || true
+          fi
+
+          if [[ "${pull_rc}" -ne 0 ]]; then
+            if [[ "${{ steps.vars.outputs.allow_local }}" == "true" ]]; then
+              echo "local_image=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::GHCR image missing/unreadable: ${IMAGE}. Run Build deps container first, or re-run with allow_local_image_build=true."
+              exit 1
+            fi
+          else
+            echo "local_image=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "${clone_rc}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Build deps image locally (opt-in fallback only)
+        if: steps.prep.outputs.local_image == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build deps image
+        if: steps.prep.outputs.local_image == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./WebKitGTK-DND-Fix/containers
+          file: ./WebKitGTK-DND-Fix/containers/Dockerfile
+          load: true
+          tags: ${{ steps.vars.outputs.image }}
+          cache-from: type=local,src=/var/cache/webkit-dnd/buildx-cache
+          cache-to: type=local,dest=/var/cache/webkit-dnd/buildx-cache,mode=max
+          provenance: false
+          sbom: false
+
+
+
+      - name: Start mid-build ccache live-sync
+        if: ${{ inputs.tests_only != true && inputs.warm_from_peer != false }}
+        continue-on-error: true
+        run: |
+          set +e
+          sudo LIVE_SYNC_INTERVAL_SEC=180 /usr/local/sbin/ccache-live-sync.sh start || true
+          exit 0
+
+      - name: Configure and build in container
+        if: ${{ inputs.tests_only != true }}
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.vars.outputs.image }}"
+          # Separate build step. ccache mount persists into the test step.
+          mkdir -p "${{ env.BUILD_HOST_DIR }}"
+          docker run --rm \
+            --name webkitgtk-dnd-build \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_MAXSIZE=${{ env.CCACHE_MAXSIZE }} \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_BASEDIR=/workspace/WebKit \
+            -e CCACHE_NOHASHDIR=true \
+            -e CCACHE_DEPEND=true \
+            -e CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime,file_macro \
+            -e WEBKIT_DIR=/workspace/WebKit \
+            -e BUILD_DIR=/workspace/WebKit/build-gtk \
+            -e OUT_DIR=/out \
+            -e NINJA_TARGETS="${{ steps.vars.outputs.targets }}" \
+            -e JOBS="$(nproc)" \
+            -v "${{ env.WEBKIT_CLONE_DIR }}:/workspace/WebKit:rw" \
+            -v "${{ env.BUILD_HOST_DIR }}:/workspace/WebKit/build-gtk:rw" \
+            -v "${{ env.CCACHE_DIR }}:/ccache:rw" \
+            -v "${{ env.OUT_DIR }}:/out:rw" \
+            -v "${{ github.workspace }}/WebKitGTK-DND-Fix/scripts:/validation-scripts:ro" \
+            -w /workspace \
+            "${IMAGE}" \
+            bash /validation-scripts/ci-build.sh \
+            2>&1 | tee "${{ env.OUT_DIR }}/docker-build.log"
+
+      - name: Run SelectionData tests in container
+        id: test
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.vars.outputs.image }}"
+          docker run --rm \
+            --name webkitgtk-dnd-test \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_BASEDIR=/workspace/WebKit \
+            -e WEBKIT_DIR=/workspace/WebKit \
+            -e BUILD_DIR=/workspace/WebKit/build-gtk \
+            -e OUT_DIR=/out \
+            -e GTEST_FILTER="${{ steps.vars.outputs.filter }}" \
+            -v "${{ env.WEBKIT_CLONE_DIR }}:/workspace/WebKit:rw" \
+            -v "${{ env.BUILD_HOST_DIR }}:/workspace/WebKit/build-gtk:rw" \
+            -v "${{ env.CCACHE_DIR }}:/ccache:rw" \
+            -v "${{ env.OUT_DIR }}:/out:rw" \
+            -v "${{ github.workspace }}/WebKitGTK-DND-Fix/scripts:/validation-scripts:ro" \
+            -w /workspace \
+            "${IMAGE}" \
+            bash /validation-scripts/ci-test-selectiondata.sh \
+            2>&1 | tee "${{ env.OUT_DIR }}/docker-test.log"
+
+
+
+
+      - name: Automated external / layer validation
+        if: ${{ always() && inputs.run_external_validation != false && (success() || inputs.tests_only == true) }}
+        shell: bash
+        env:
+          OUT_DIR: ${{ env.OUT_DIR }}
+          HTML_DIR: ${{ github.workspace }}/WebKitGTK-DND-Fix/html
+        run: |
+          set -euo pipefail
+          SCRIPT="${{ github.workspace }}/WebKitGTK-DND-Fix/scripts/ci-external-validation.sh"
+          chmod +x "$SCRIPT"
+          GTEST_LOG="${{ env.OUT_DIR }}/selectiondata-tests.log" \
+            OUT_DIR="${{ env.OUT_DIR }}" HTML_DIR="$HTML_DIR" \
+            "$SCRIPT"
+
+      - name: Stamp last-good unit
+        if: success()
+        shell: bash
+        run: |
+          set +e
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/ci-write-last-good-unit.sh /usr/local/sbin/ 2>/dev/null || true
+          OUT_DIR="${{ env.OUT_DIR }}" BUILD_HOST_DIR="${{ env.BUILD_HOST_DIR }}" \
+            bash WebKitGTK-DND-Fix/scripts/ci-write-last-good-unit.sh || true
+          # success snapshot (small-ish assist for peers)
+          sudo MODE=save-push SNAP_NAME=build-gtk-unit BUILD_HOST_DIR="${{ env.BUILD_HOST_DIR }}" \
+            /usr/local/sbin/build-tree-snapshot.sh || true
+
+
+      - name: Snapshot build-tree on failure (peer resume)
+        if: ${{ failure() && inputs.snapshot_on_failure != false }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          sudo install -m 755 WebKitGTK-DND-Fix/scripts/build-tree-snapshot.sh /usr/local/sbin/build-tree-snapshot.sh || true
+          sudo MODE=save-push SNAP_NAME=build-gtk-unit BUILD_HOST_DIR="${{ env.BUILD_HOST_DIR }}" \
+            GIT_HEAD="$(cat ${{ env.OUT_DIR }}/git-head.txt 2>/dev/null | head -1)" \
+            /usr/local/sbin/build-tree-snapshot.sh || true
+
+      - name: Reclaim workspace after docker (avoid checkout Post EACCES)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          chmod +x WebKitGTK-DND-Fix/scripts/workspace-fix-root-owned.sh 2>/dev/null || true
+          bash WebKitGTK-DND-Fix/scripts/workspace-fix-root-owned.sh "${{ github.workspace }}" || true
+          exit 0
+
+      - name: Stop live-sync + final ccache push
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          sudo /usr/local/sbin/ccache-live-sync.sh stop || true
+          exit 0
+
+      - name: Persistent cache stats
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "${{ env.OUT_DIR }}"
+          {
+            echo "=== host ccache ==="
+            CCACHE_DIR="${{ env.CCACHE_DIR }}" ccache -s 2>/dev/null || true
+            echo "ccache_dir_bytes=$(du -sb "${{ env.CCACHE_DIR }}" 2>/dev/null | awk '{print $1}')"
+            echo "build_dir_bytes=$(du -sb "${{ env.BUILD_HOST_DIR }}" 2>/dev/null | awk '{print $1}')"
+            df -h / /var/cache/webkit-dnd 2>/dev/null || df -h /
+          } | tee "${{ env.OUT_DIR }}/persistent-cache-stats.log"
+
+      - name: Pack small artifact bundle
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          OUT="${{ env.OUT_DIR }}"
+          mkdir -p "${OUT}/bundle"
+          for f in \
+            summary.log \
+            build-summary.log \
+            environment.log \
+            test-environment.log \
+            selectiondata-tests.log \
+            selectiondata-tests.tail.log \
+            cmake.tail.log \
+            ninja.tail.log \
+            ninja.fail.tail.log \
+            ninja.log.zst \
+            ninja.log.gz \
+            ccache-after-build.log \
+            webkit-head.txt \
+            docker-pull.log \
+            git-clone.log \
+            prep-errors.log \
+            layer-checklist.txt \
+            layer-checklist-auto.txt \
+            external-validation.log \
+            docker-build.log \
+            docker-test.log
+          do
+            [[ -f "${OUT}/${f}" ]] && cp -a "${OUT}/${f}" "${OUT}/bundle/" || true
+          done
+          if [[ -f "${OUT}/bundle/docker-build.log" ]]; then
+            tail -c 2000000 "${OUT}/bundle/docker-build.log" >"${OUT}/bundle/docker-build.tail.log" || true
+            rm -f "${OUT}/bundle/docker-build.log"
+          fi
+          if [[ -f "${OUT}/bundle/docker-test.log" ]]; then
+            tail -c 2000000 "${OUT}/bundle/docker-test.log" >"${OUT}/bundle/docker-test.tail.log" || true
+            rm -f "${OUT}/bundle/docker-test.log"
+          fi
+          (cd "${OUT}/bundle" && tar -I 'zstd -19' -cf "${OUT}/ci-logs.tar.zst" .) || true
+          (cd "${OUT}/bundle" && tar -czf "${OUT}/ci-logs.tar.gz" .) || true
+          date -u >"${OUT}/bundle-status.txt" || true
+          ls -la "${OUT}" >"${OUT}/out-listing.txt" || true
+          # never fail the pack step; missing files are normal on incomplete runs
+          exit 0
+
+      # Release before artifact upload/prune so a green run always leaves a Release.
+      - name: Publish validation GitHub Release
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${{ env.OUT_DIR }}"
+          DAY="$(date -u +%Y%m%d)"
+          PRETTY="$(date -u +%Y-%m-%d)"
+          TAG="validation-${DAY}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            TAG="validation-${DAY}-${{ github.run_id }}"
+          fi
+          mkdir -p "${OUT}/release"
+          if [[ -d WebKitGTK-DND-Fix/html ]]; then
+            (cd WebKitGTK-DND-Fix && zip -qr "${OUT}/release/html-harness.zip" html)
+          fi
+          for f in ci-logs.tar.zst ci-logs.tar.gz selectiondata-tests.log summary.log webkit-head.txt build-summary.log; do
+            [[ -f "${OUT}/${f}" ]] && cp -a "${OUT}/${f}" "${OUT}/release/" || true
+          done
+          {
+            echo "Validation build ${PRETTY} (UTC)."
+            echo ""
+            echo "- workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- image: \`${{ steps.vars.outputs.image }}\`"
+            echo "- webkit: \`${{ steps.vars.outputs.repo_url }}\` @ \`${{ steps.vars.outputs.ref }}\`"
+            echo "- ninja targets: \`${{ steps.vars.outputs.targets }}\`"
+            echo "- gtest: \`${{ steps.vars.outputs.filter }}\`"
+            echo ""
+            echo "### WebKit HEAD"
+            echo '```'
+            cat "${OUT}/webkit-head.txt" 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "### Summary"
+            echo '```'
+            cat "${OUT}/summary.log" 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "Not an upstream WebKitGTK release. Private validation assets only."
+          } > "${OUT}/release/notes.md"
+          assets=()
+          while IFS= read -r -d '' f; do
+            assets+=("$f")
+          done < <(find "${OUT}/release" -maxdepth 1 -type f ! -name notes.md -print0)
+          gh release create "${TAG}" \
+            --title "WebKitGTK DnD validation ${PRETTY}" \
+            --notes-file "${OUT}/release/notes.md" \
+            "${assets[@]}"
+          echo "Published ${TAG}"
+
+      - name: Upload CI logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkit-gtk-dnd-logs-${{ github.run_id }}
+          path: |
+            ${{ env.OUT_DIR }}/ci-logs.tar.zst
+            ${{ env.OUT_DIR }}/ci-logs.tar.gz
+            ${{ env.OUT_DIR }}/summary.log
+            ${{ env.OUT_DIR }}/build-summary.log
+            ${{ env.OUT_DIR }}/selectiondata-tests.log
+            ${{ env.OUT_DIR }}/selectiondata-tests.tail.log
+            ${{ env.OUT_DIR }}/environment.log
+            ${{ env.OUT_DIR }}/test-environment.log
+            ${{ env.OUT_DIR }}/cmake.tail.log
+            ${{ env.OUT_DIR }}/ninja.tail.log
+            ${{ env.OUT_DIR }}/ninja.fail.tail.log
+            ${{ env.OUT_DIR }}/ninja.log.zst
+            ${{ env.OUT_DIR }}/ninja.log.gz
+            ${{ env.OUT_DIR }}/ccache-after-build.log
+            ${{ env.OUT_DIR }}/webkit-head.txt
+            ${{ env.OUT_DIR }}/docker-pull.log
+            ${{ env.OUT_DIR }}/git-clone.log
+            ${{ env.OUT_DIR }}/prep-errors.log
+            ${{ env.OUT_DIR }}/layer-checklist.txt
+            ${{ env.OUT_DIR }}/docker-build.log
+            ${{ env.OUT_DIR }}/docker-test.log
+            ${{ env.OUT_DIR }}/docker-build.tail.log
+            ${{ env.OUT_DIR }}/docker-test.tail.log
+            ${{ env.OUT_DIR }}/out-listing.txt
+            ${{ env.OUT_DIR }}/bundle-status.txt
+            ${{ env.OUT_DIR }}/*.log
+            ${{ env.OUT_DIR }}/*.tail.log
+          if-no-files-found: warn
+          retention-days: 5
+          compression-level: 9
+
+      - name: Prune old Actions artifacts
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set +e
+          chmod +x WebKitGTK-DND-Fix/scripts/prune-actions-artifacts.sh
+          WebKitGTK-DND-Fix/scripts/prune-actions-artifacts.sh 5 || true
+          exit 0
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## WebKitGTK DnD CI"
+            echo ""
+            echo "- host: \`$(hostname)\`"
+            echo "- image: \`${{ steps.vars.outputs.image }}\`"
+            echo "- webkit: \`${{ steps.vars.outputs.repo_url }}\` @ \`${{ steps.vars.outputs.ref }}\`"
+            echo "- targets: \`${{ steps.vars.outputs.targets }}\`"
+            echo "- gtest: \`${{ steps.vars.outputs.filter }}\`"
+            echo "- build step: \`${{ steps.build.conclusion }}\`"
+            echo ""
+            echo "### WebKit HEAD"
+            echo '```'
+            cat "${{ env.OUT_DIR }}/webkit-head.txt" 2>/dev/null || true
+            echo '```'
+            echo "### Test tail"
+            echo '```'
+            tail -n 40 "${{ env.OUT_DIR }}/selectiondata-tests.log" 2>/dev/null || true
+            echo '```'
+            echo "### Summary"
+            echo '```'
+            cat "${{ env.OUT_DIR }}/summary.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Never block job completion on peer sync. Fire-and-forget background unit.
+      - name: Background peer cache sync (non-blocking)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+          if [[ -x /usr/local/sbin/webkit-dnd-peer-sync.sh ]]; then
+            sudo -n systemd-run --unit=webkit-dnd-peer-sync-job-$RANDOM \
+              --collect --nice=10 \
+              /bin/bash -lc 'SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh' || \
+              nohup env SYNC_MODE=quick /usr/local/sbin/webkit-dnd-peer-sync.sh >>/var/cache/webkit-dnd/out/peer-sync.log 2>&1 &
+          true
+          fi
+          exit 0

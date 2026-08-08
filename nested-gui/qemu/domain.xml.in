@@ -1,0 +1,29 @@
+<!-- libvirt domain template sketch: substitute @OVERLAY@ @CPUS@ @MEM_MIB@ @IN@ @OUT@ -->
+<domain type='kvm'>
+  <name>webkit-dnd-gui</name>
+  <memory unit='MiB'>@MEM_MIB@</memory>
+  <vcpu>@CPUS@</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features><acpi/><apic/></features>
+  <cpu mode='host-passthrough'/>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='@OVERLAY@'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <interface type='user'><model type='virtio'/></interface>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
+    <video><model type='virtio' heads='1'/></video>
+    <filesystem type='mount' accessmode='passthrough'>
+      <source dir='@IN@'/><target dir='dndin'/><driver type='virtiofs' queue='1024'/>
+    </filesystem>
+    <filesystem type='mount' accessmode='passthrough'>
+      <source dir='@OUT@'/><target dir='dndout'/><driver type='virtiofs' queue='1024'/>
+    </filesystem>
+    <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>
+  </devices>
+</domain>

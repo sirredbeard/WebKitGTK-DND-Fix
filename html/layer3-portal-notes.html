@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layer 3: portal notes</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 46rem; }
+  #dst { border: 2px dashed #333; padding: 2rem; background: #f0e8ff; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; }
+</style>
+<h1>Layer 3: portal / GdkFileList</h1>
+<p>Unit-level behavior is covered in DropTargetGtk4: when portal MIME types
+present, filenames come from GdkFileList paths and file:// lines in
+text/uri-list are ignored for the grant.</p>
+<p>Manual check in a Flatpak or portal session:</p>
+<ol>
+  <li>Run the browser under a portal-using sandbox if available.</li>
+  <li>Drop a file from the host file manager into the box below.</li>
+  <li>Expect files.length &gt;= 1 (portal grant works).</li>
+  <li>There is no safe pure-HTML way to attach a hostile parallel uri-list to a
+      real portal drop; treat code review + Layer 1 as the hostile half.</li>
+</ol>
+<div id="dst">Portal session: drop a host file here</div>
+<div id="log"></div>
+<script>
+const dst = document.getElementById('dst');
+const log = document.getElementById('log');
+dst.addEventListener('dragover', e => e.preventDefault());
+dst.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files;
+  log.textContent = 'files.length=' + f.length + '\n' +
+    [...f].map((x,i) => i + ': ' + x.name + ' ' + x.size).join('\n');
+});
+</script>

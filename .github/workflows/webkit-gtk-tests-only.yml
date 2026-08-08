@@ -1,0 +1,48 @@
+# Re-run WebKit TestWebCore SelectionData + external validation without full rebuild.
+name: WebKitGTK DnD tests only
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_repository:
+        type: string
+        default: sirredbeard/WebKit
+      webkit_ref:
+        type: string
+        default: gtk-dnd-file-access-reenable
+      gtest_filter:
+        type: string
+        default: SelectionData.*
+      runner_label:
+        type: choice
+        options: [any, azure, vultr]
+        default: any
+      restore_build_snapshot:
+        type: boolean
+        default: true
+
+concurrency:
+  group: webkit-tests-only-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+
+jobs:
+  tests:
+    uses: ./.github/workflows/webkit-gtk-dnd.yml
+    secrets: inherit
+    with:
+      webkit_repository: ${{ inputs.webkit_repository }}
+      webkit_ref: ${{ inputs.webkit_ref }}
+      gtest_filter: ${{ inputs.gtest_filter }}
+      ninja_targets: TestWebCore
+      runner_label: ${{ inputs.runner_label }}
+      warm_from_peer: true
+      tests_only: true
+      restore_build_snapshot: ${{ inputs.restore_build_snapshot }}
+      run_external_validation: true
+      snapshot_on_failure: false
+      allow_local_image_build: false

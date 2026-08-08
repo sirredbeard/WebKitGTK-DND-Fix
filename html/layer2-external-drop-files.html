@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layer 2: external file drop</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+  #dst { border: 2px dashed #333; padding: 3rem; background: #e8ffe8; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+</style>
+<h1>Layer 2: external user file drop</h1>
+<p>From Nautilus/Files, drag a normal file (for example a small text file you own)
+onto the green box.</p>
+<p><strong>Pass:</strong> <code>files.length &gt;= 1</code> and name matches.
+<strong>Fail:</strong> empty files on a real external drop with a patched build.</p>
+<div id="dst">Drop a real file from the file manager here</div>
+<div id="log"></div>
+<script>
+const log = (msg, cls) => {
+  document.getElementById('log').innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+};
+const dst = document.getElementById('dst');
+dst.addEventListener('dragover', (e) => { e.preventDefault(); });
+dst.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const dt = e.dataTransfer;
+  log('types: ' + JSON.stringify([...dt.types]));
+  log('getData(text/uri-list): ' + JSON.stringify(dt.getData('text/uri-list')));
+  log('files.length: ' + dt.files.length);
+  for (let i = 0; i < dt.files.length; i++)
+    log('file[' + i + ']: name=' + dt.files[i].name + ' size=' + dt.files[i].size + ' type=' + dt.files[i].type);
+  if (dt.files.length >= 1)
+    log('PASS: external drop produced File objects', 'pass');
+  else
+    log('FAIL: external drop produced no files (broken restore or portal path)', 'fail');
+});
+</script>

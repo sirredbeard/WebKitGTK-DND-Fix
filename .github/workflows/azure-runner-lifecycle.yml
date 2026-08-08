@@ -1,0 +1,118 @@
+# Wake / daily maintain the Azure self-hosted runner VM.
+# - schedule: once daily start Azure, seed mirrors + GHCR, peer sync, then leave idle watchdog to stop after 30m
+# - workflow_dispatch: manual wake or maintain
+# - repository_dispatch type wake-azure: optional external kick
+# - called implicitly: other workflows run scripts/azure-vm-wake via a light github-hosted job
+name: Azure runner lifecycle
+
+on:
+  schedule:
+    # Once a day UTC morning
+    - cron: "15 11 * * *"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: wake only, or wake+maintain (seed/sync)
+        type: choice
+        options:
+          - wake
+          - maintain
+        default: maintain
+  repository_dispatch:
+    types: [wake-azure]
+
+concurrency:
+  group: azure-runner-lifecycle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  packages: read
+
+jobs:
+  wake:
+    name: Start Azure VM + wait for runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Checkout wake script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/azure-vm-wake.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Wake VM
+        env:
+          AZURE_RG: ${{ secrets.AZURE_RG }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURE_WAKE_WAIT_SECS: "720"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/azure-vm-wake.sh
+          ./scripts/azure-vm-wake.sh
+
+  maintain:
+    name: Daily seed + peer sync on Azure
+    needs: wake
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'repository_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'maintain')
+    runs-on: [self-hosted, linux, x64, webkit-dnd, azure]
+    timeout-minutes: 120
+    steps:
+      - name: Mark activity + maintenance lock
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/webkit-dnd /var/cache/webkit-dnd/out
+          echo "$$" | sudo tee /etc/webkit-dnd/MAINTENANCE_LOCK >/dev/null
+          mkdir -p /var/cache/webkit-dnd/out
+          date -u +%s > /var/cache/webkit-dnd/out/last-runner-activity 2>/dev/null || date -u +%s | sudo -n tee /var/cache/webkit-dnd/out/last-runner-activity >/dev/null || true
+
+      - name: Checkout seed scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Install scripts to host sbin
+        run: |
+          set -euo pipefail
+          sudo install -m 755 scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-peer-sync.sh
+          sudo install -m 755 scripts/webkit-dnd-peer-sync.sh /usr/local/sbin/webkit-dnd-cache-sync.sh
+          sudo install -m 755 scripts/webkit-dnd-daily-seed.sh /usr/local/sbin/webkit-dnd-daily-seed.sh
+          sudo install -m 755 scripts/seed-runner-mirrors.sh /usr/local/sbin/seed-runner-mirrors.sh || true
+          sudo install -m 755 scripts/azure-idle-watchdog.sh /usr/local/sbin/azure-idle-watchdog.sh || true
+
+      - name: Seed mirrors, GHCR, peer sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          sudo -E /usr/local/sbin/webkit-dnd-daily-seed.sh
+
+      - name: Clear maintenance lock
+        if: always()
+        run: sudo rm -f /etc/webkit-dnd/MAINTENANCE_LOCK
+
+      - name: Note idle shutdown
+        run: |
+          echo "Maintenance done. Idle watchdog will deallocate after ~30 minutes with no jobs."
