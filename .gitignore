@@ -1,0 +1,13 @@
+.DS_Store
+*~
+*.swp
+__pycache__/
+out/
+
+# Never commit screenshots or local observe dumps
+**/screenshots/
+*.png
+*.jpg
+*.jpeg
+*.webp
+/out/

@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>files=?</title>
+<p>Drag a file from the file manager onto the red box. The window title
+reports dataTransfer.files.length.</p>
+<div id="d" style="width:300px;height:300px;border:2px solid red"></div>
+<script>
+d.ondragover = e => e.preventDefault();
+d.ondrop = e => {
+    e.preventDefault();
+    document.title = "files=" + e.dataTransfer.files.length;
+};
+</script>

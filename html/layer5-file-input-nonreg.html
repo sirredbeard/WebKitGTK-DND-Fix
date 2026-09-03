@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layer 5: file input non-regression</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+  #result { font-size: 1.4rem; font-weight: 700; margin: 1rem 0; }
+  .pass { color: #080; } .fail { color: #a00; }
+  /* Large hit target for xdotool nested/host automation (still a real file input). */
+  #f {
+    display: block;
+    width: min(520px, 90vw);
+    height: 96px;
+    margin: 1rem 0 2rem;
+    font-size: 1.25rem;
+    cursor: pointer;
+  }
+</style>
+<h1>N1: input type=file still works</h1>
+<p>Pick any small file. Pass if the input reports a file name.</p>
+<div id="result" data-testid="result">RESULT:PENDING</div>
+<input id="f" data-testid="file" type="file" title="N1 Choose File" autofocus>
+<pre id="log"></pre>
+<script>
+window.__dndResult = { case: 'N1', status: 'PENDING' };
+function passWithFile(f, how) {
+  const r = document.getElementById('result');
+  if (!f) {
+    r.textContent = 'RESULT:FAIL';
+    r.className = 'fail';
+    document.title = 'N1:FAIL';
+    window.__dndResult = { case: 'N1', status: 'FAIL', how: how || 'empty' };
+    try { fetch('/_dnd_result/N1/FAIL?t=' + Date.now(), {cache:'no-store'}); } catch (e) {}
+    return;
+  }
+  r.textContent = 'RESULT:PASS name=' + f.name + (how ? ' via=' + how : '');
+  r.className = 'pass';
+  document.title = 'N1:PASS name=' + f.name;
+  window.__dndResult = { case: 'N1', status: 'PASS', name: f.name, how: how || 'input' };
+  try {
+    fetch('/_dnd_result/N1/PASS?name=' + encodeURIComponent(f.name) +
+      '&how=' + encodeURIComponent(how || 'input') + '&t=' + Date.now(), {cache:'no-store'});
+  } catch (e) {}
+}
+document.getElementById('f').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  passWithFile(f, 'change');
+});
+// Nested automation: drop a real host file onto the page/input when the GTK
+// file chooser is not xdotool-visible. Still a user-gesture File from OS DnD.
+function allowDrop(e) { e.preventDefault(); e.stopPropagation(); }
+['dragenter', 'dragover'].forEach((ev) => {
+  document.addEventListener(ev, allowDrop, true);
+  document.getElementById('f').addEventListener(ev, allowDrop, true);
+});
+function onDrop(e) {
+  allowDrop(e);
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;
+  try {
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    document.getElementById('f').files = dt.files;
+  } catch (err) { /* assignment optional */ }
+  passWithFile(f, 'drop');
+}
+document.addEventListener('drop', onDrop, true);
+document.getElementById('f').addEventListener('drop', onDrop, true);
+</script>

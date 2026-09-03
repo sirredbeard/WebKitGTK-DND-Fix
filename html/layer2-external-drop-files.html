@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layer 2: external file drop</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+  #dst { border: 2px dashed #333; padding: 3rem; background: #e8ffe8; min-height: 8rem; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; max-height: 18rem; overflow: auto; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+  #result { font-size: 1.3rem; font-weight: 700; margin: 1rem 0; }
+</style>
+<h1>Layer 2: external user file drop (Nautilus)</h1>
+<p>From <strong>Nautilus/Files</strong>, drag real user files onto the green box.
+This page accumulates drops so multiple types can be proven in one run.</p>
+<p><strong>Pass:</strong> File objects for required names
+<code>sample-drop.txt</code>, <code>sample.png</code>, <code>sample.html</code>.
+Web-authored uri-list attacks are covered by Layer 1 (must stay empty).</p>
+<div id="result" data-testid="result">RESULT:PENDING</div>
+<div id="dst" data-testid="dst">Drop real files from Nautilus here (txt, png, html)</div>
+<div id="log" data-testid="log"></div>
+<script>
+const REQUIRED = ['sample-drop.txt', 'sample.png', 'sample.html'];
+const seen = Object.create(null);
+window.__dndResult = { case: 'F1', status: 'PENDING', filesLength: 0, names: [], required: REQUIRED };
+const log = (msg, cls) => {
+  document.getElementById('log').innerHTML += '<span class="' + (cls || '') + '">' + msg + '</span>\n';
+};
+const emit = (status, detail) => {
+  const names = Object.keys(seen).sort();
+  const filesLength = names.length;
+  window.__dndResult = {
+    case: 'F1', status, filesLength, names, required: REQUIRED,
+    detail: detail || '', byName: seen
+  };
+  const r = document.getElementById('result');
+  r.textContent = 'RESULT:' + status + ' files=' + filesLength + ' names=' + names.join(',') + (detail ? ' ' + detail : '');
+  r.className = status === 'PASS' ? 'pass' : (status === 'FAIL' ? 'fail' : '');
+  document.title = 'F1:' + status + ' files=' + filesLength;
+  try { document.body.setAttribute('data-dnd-result', status); } catch (e) {}
+  try {
+    fetch('/_dnd_result/F1/' + encodeURIComponent(status) + '?t=' + Date.now() + '&names=' + encodeURIComponent(names.join(',')), {
+      cache: 'no-store', mode: 'cors'
+    });
+  } catch (e) {}
+};
+const recompute = () => {
+  const missing = REQUIRED.filter((n) => !seen[n]);
+  if (missing.length === 0) {
+    log('PASS: all required external File objects present: ' + REQUIRED.join(','), 'pass');
+    emit('PASS', 'multi-type-ok');
+    return;
+  }
+  const names = Object.keys(seen);
+  if (names.length === 0) {
+    emit('PENDING', 'waiting');
+    return;
+  }
+  log('progress: have=[' + names.join(',') + '] missing=[' + missing.join(',') + ']');
+  emit('PENDING', 'missing:' + missing.join(','));
+};
+const dst = document.getElementById('dst');
+dst.addEventListener('dragover', (e) => { e.preventDefault(); });
+dst.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const dt = e.dataTransfer;
+  log('--- drop ---');
+  log('types: ' + JSON.stringify([...dt.types]));
+  log('getData(text/uri-list): ' + JSON.stringify(dt.getData('text/uri-list')));
+  log('files.length: ' + dt.files.length);
+  if (dt.files.length === 0) {
+    log('FAIL drop: empty files (broken restore / attack path)', 'fail');
+    if (Object.keys(seen).length === 0) emit('FAIL', 'empty-files');
+    return;
+  }
+  for (let i = 0; i < dt.files.length; i++) {
+    const f = dt.files[i];
+    seen[f.name] = { size: f.size, type: f.type || '' };
+    log('file[' + i + ']: name=' + f.name + ' size=' + f.size + ' type=' + f.type, 'pass');
+  }
+  recompute();
+});
+</script>

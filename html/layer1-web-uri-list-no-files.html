@@ -1,0 +1,64 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layer 1: web uri-list no files</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+  #src, #dst { border: 2px dashed #333; padding: 2rem; margin: 1rem 0; }
+  #src { background: #fff3cd; }
+  #dst { background: #e7f1ff; min-height: 4rem; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+  #result { font-size: 1.4rem; font-weight: 700; margin: 1rem 0; }
+</style>
+<h1>Layer 1: web-authored file:// uri-list</h1>
+<p>Drag from the yellow box into the blue box. The page sets
+<code>text/uri-list</code> to <code>file:///etc/passwd</code> on dragstart.</p>
+<p><strong>Pass:</strong> <code>files.length === 0</code> and no file name/size from passwd.
+<strong>Fail:</strong> any File object for that path.</p>
+<div id="result" data-testid="result">RESULT:PENDING</div>
+<div id="src" draggable="true" data-testid="src">Drag me</div>
+<div id="dst" data-testid="dst">Drop here</div>
+<div id="log" data-testid="log"></div>
+<script>
+window.__dndResult = { case: 'S1', status: 'PENDING', filesLength: null, detail: '' };
+const log = (msg, cls) => {
+  const el = document.getElementById('log');
+  el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+};
+const setResult = (status, detail, filesLength) => {
+  window.__dndResult = { case: 'S1', status, filesLength, detail };
+  const r = document.getElementById('result');
+  r.textContent = 'RESULT:' + status + (detail ? ' ' + detail : '');
+  r.className = status === 'PASS' ? 'pass' : (status === 'FAIL' ? 'fail' : '');
+  document.title = 'S1:' + status + ' files=' + filesLength;
+  try { document.body.setAttribute('data-dnd-result', status); } catch (e) {}
+  // Nested automation: Epiphany window title often stays "epiphany"; beacon instead.
+  try { fetch('/_dnd_result/S1/' + encodeURIComponent(status) + '?t=' + Date.now(), {cache:'no-store', mode:'cors'}); } catch (e) {}
+};
+document.getElementById('src').addEventListener('dragstart', (e) => {
+  e.dataTransfer.setData('text/uri-list', 'file:///etc/passwd');
+  e.dataTransfer.setData('text/plain', 'file:///etc/passwd');
+  e.dataTransfer.effectAllowed = 'copy';
+});
+const dst = document.getElementById('dst');
+dst.addEventListener('dragover', (e) => { e.preventDefault(); });
+dst.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const dt = e.dataTransfer;
+  const types = [...dt.types];
+  const uri = dt.getData('text/uri-list');
+  const files = dt.files;
+  log('types: ' + JSON.stringify(types));
+  log('getData(text/uri-list): ' + JSON.stringify(uri));
+  log('files.length: ' + files.length);
+  for (let i = 0; i < files.length; i++)
+    log('file[' + i + ']: name=' + files[i].name + ' size=' + files[i].size);
+  if (files.length === 0) {
+    log('PASS: no File objects from web-authored file:// uri-list', 'pass');
+    setResult('PASS', 'no File objects', 0);
+  } else {
+    log('FAIL: web-authored uri-list produced File objects', 'fail');
+    setResult('FAIL', 'files granted', files.length);
+  }
+});
+</script>
