@@ -15,8 +15,6 @@ Michael Catanzaro disabled file access on 2025-12-03 in commit `89838b9164a1`
 > other ports. My initial attempts to fix things have failed, so let's just
 > completely disable it for now.
 
-He tried to fix it properly. He could not. So he disabled it.
-
 The disable commit is two files and five added lines:
 
 - `Source/WebCore/dom/DataTransfer.h` +5/-0
@@ -130,30 +128,6 @@ dated 2026-08-10. Ten commits. Verified against the GitHub API, not from memory.
 - SHAs in findings drifted because the branch was rebased. `ae64af0353` and
   `17647b75df` are orphaned. Their current equivalents are `adc3c73d4` and
   `62c2aeca1`. Do not chase the old SHAs.
-- The copilot instructions claim the private CI bar was met at `ae64af0353`.
-  The branch moved two commits past that point afterward. Whatever we validated,
-  we did not validate the current tip end to end.
-- The GitHub Actions run IDs cited as proof across findings now return 404. All
-  workflow runs were deleted on 2026-09-01 at the operator's request. The
-  validation GitHub Releases survived and still carry the run ID in the tag,
-  the built artifacts, and `webkit-head.txt`. Release
-  `validation-20260810-gnome-web-31402215302` records engine tip
-  `9d2732f8c1457f9c285888ce383a02e1a1412add`. Use releases as the receipt from
-  now on, not run URLs.
-
-### Correction, later on 2026-09-02: the branch is one commit now
-
-The "ten commits, tip `9d2732f8c`" paragraph above was true when written and
-is not true now. The series was squashed to a single commit the same day. Tip
-was `30f09212e3` on upstream base `f374cf141b` (amended to `108eb10b76` on
-2026-09-03, message only), the local checkout and GitHub agree, and the tree hash is `b695c1e46895acf0f6e4703e432d4b7c700ac117`, the
-same tree the negative control matrix in `testing-plan.md` ran on. The
-ten-commit history is kept on local branches `backup-ten-commits` and
-`backup-premerge-b66d907` in the WebKit checkout. Every SHA named in the
-paragraph above is orphaned, including the two it called current.
-
-The README sentences quoted above were fixed the same day, so they no longer
-appear there. The quotes stay here as the record of what was wrong.
 
 ## The plan
 
@@ -299,49 +273,6 @@ ever see one. Debugging Flatpak module builds is not progress on this bug.
   the packaging and nested GUI pipeline. Removing the pipeline removes the
   demand.
 
-## Why this gets accepted
-
-Catanzaro's stated reason for the disable was that he could not fix it properly.
-A patch that gives GTK an end to end file drop test, and then narrows the trust
-boundary with that test as proof, answers his actual objection. It also pays down a nine-year-old bug that Igalia has
-tripped over repeatedly.
-
-Small, boring, backport friendly, and tested. That is the bar.
-
-## Bug report: arguing the test seam without narrating ourselves
-
-Comment 0 originally said the tests avoid "attempting synthetic GDK events
-again". The word "again" was the defect. We never attempted synthetic GDK
-events, so it implied a history that does not exist, and even if we had, our
-route to the patch is not the reader's problem. This is the same process
-narration already cut from the engine commit message, reappearing in a
-different document. It is worth watching for, because it creeps in wherever
-we explain a decision we spent time on.
-
-The replacement argues mechanism. Three claims, all verifiable from the tree:
-
-- Synthetic GDK motion events are not delivered to GdkDragContext, so
-  DRAG_MOTION never fires and the drag protocol stalls at its first step.
-  That is the standing diagnosis on 157179, unchanged since 2016.
-- beginDragWithFiles exists only in Tools/DumpRenderTree/mac and
-  Tools/DumpRenderTree/DumpRenderTreeFileDraggingSource.h. It is legacy
-  WebKit1 and mac-only.
-- Tools/WebKitTestRunner/EventSenderProxy.h declares no drag entry point for
-  any port, Cocoa included.
-
-Together those mean "just implement beginDragWithFiles for GTK" is not the
-small ask it sounds like. It is a proposal to design a cross-port testing API
-in a shared header as a precondition for a GTK security fix. That is a larger
-review surface than the fix itself and it draws in reviewers with no stake in
-this bug. Stating that preempts the obvious objection instead of waiting for
-it.
-
-The load-bearing sentence is that the test hook supplies inputs, not
-conclusions. It does not set a grant, skip a check, or shortcut
-allowsFileAccess(). A security reviewer will probe that first, because a
-harness that sets the grant it claims to verify proves nothing. Volunteering
-it is cheaper than being caught by it.
-
 ### Two claims that failed verification
 
 Both were caught by checking before committing, and both would have been
@@ -357,18 +288,6 @@ credibility hits in a first contribution.
 The general rule: every number and adjacency claim in upstream-facing text
 gets re-derived from the tree at write time. Numbers gathered earlier in a
 session go stale silently and nothing warns you.
-
-### Length
-
-Comment 0 was around 1400 words against roughly 250 for bug 322068, the
-outside-contributor model. Superseded later on 2026-09-02: the comparable
-bug survey in `webkit-norms-and-reviewers.md` cut it to about 380 words and
-moved the questions to prepared replies and a PR self-review comment. The
-paragraphs below record the earlier reasoning. Accepted deliberately. The ask is to reopen a
-CVE-adjacent path, the testing approach is the most likely part to be
-rejected, and deferring it to a pull request means it only gets read after
-someone already agrees with the premise. That wastes a review round. If it
-has to shrink, cut mechanism detail and keep the questions.
 
 ## Filed. Bug 323277 and PR 73114, 2026-09-03
 
