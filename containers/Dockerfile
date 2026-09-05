@@ -1,4 +1,8 @@
-# WebKitGTK-DND-Fix builder (Fedora 44)
+# WebKitGTK-DND-Fix builder (Fedora 43)
+# Fedora 43 ships glibc 2.42, matching org.gnome.Platform//50 exactly.
+# Fedora 44/45 ship glibc 2.43, which produces a WebKitGTK build that fails
+# to load inside the GNOME 50 runtime (undefined GLIBC_2.43 symbols).
+#
 # Layer strategy (top = changes least often):
 #   1) base OS
 #   2) core toolchain packages (packages-core.txt)
@@ -11,10 +15,10 @@
 #   DOCKER_BUILDKIT=1 docker build ...
 
 # syntax=docker/dockerfile:1.6
-FROM fedora:44
+FROM fedora:43
 
 LABEL org.opencontainers.image.title="WebKitGTK-DND-Fix-builder"
-LABEL org.opencontainers.image.description="Fedora 44 toolchain for WebKitGTK, SelectionData tests, GNOME Web AppImage + Flatpak"
+LABEL org.opencontainers.image.description="Fedora 43 toolchain for WebKitGTK, SelectionData tests, GNOME Web AppImage + Flatpak"
 LABEL org.opencontainers.image.source="https://github.com/sirredbeard/WebKitGTK-DND-Fix"
 
 # --- Layer: core toolchain (stable) ---
