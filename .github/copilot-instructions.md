@@ -288,11 +288,17 @@ number only.
 
 ## CI and container
 
-- Base image OS: Fedora 44
+- Base image OS: Fedora 43 (glibc parity with the GNOME 50 runtime; see
+  containers/Dockerfile)
 - Builder image title: WebKitGTK-DND-Fix-builder
 - GHCR package (lowercase): `ghcr.io/<owner>/webkitgtk-dnd-fix-builder`
-- **Image tags are UTC date only** (`YYYYMMDD`). No `fedora44` tag, no `sha-*`
-  floating tags on the image. Optional `tag_extra` input only when explicitly set.
+- **Image tags**: the `builder-image` workflow builds both arches on
+  native runners and pushes `latest-<arch>` and `YYYY.MM.DD-<arch>`;
+  the plain `latest` and `YYYY.MM.DD` tags are multi-arch manifests
+  over both. Consumers pull `latest` (copilot-desktop-gtk's
+  webkit-dnd-rebuild does). This replaces the old date-only tag note:
+  the image already carried `latest` in practice, and the rebuild
+  workflow names it.
 - Build/test resolves the newest date tag when `image_tag` input is empty
 - Manual `Build deps container` then prune GHCR to newest two **date** tags;
   prune Actions artifacts keep 5
