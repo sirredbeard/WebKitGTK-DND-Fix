@@ -22,13 +22,20 @@ LABEL org.opencontainers.image.description="Fedora 43 toolchain for WebKitGTK, S
 LABEL org.opencontainers.image.source="https://github.com/sirredbeard/WebKitGTK-DND-Fix"
 
 # --- Layer: core toolchain (stable) ---
+# nasm is x86 only (an x86 assembler; Fedora does not ship it for
+# aarch64) and nothing in the WebKit build needs it off x86 - the media
+# libraries carry their own Arm assembly. It stays in
+# packages-core.txt; the install below drops it on non-x86 builds.
 COPY packages-core.txt /tmp/packages-core.txt
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
     --mount=type=cache,target=/var/lib/dnf,sharing=locked \
     set -eux; \
     dnf -y upgrade --refresh --setopt=install_weak_deps=False || true; \
-    dnf -y install --setopt=install_weak_deps=False \
-        $(grep -vE '^\s*(#|$)' /tmp/packages-core.txt); \
+    pkgs="$(grep -vE '^\s*(#|$)' /tmp/packages-core.txt)"; \
+    if [ "$(uname -m)" != "x86_64" ]; then \
+        pkgs="$(printf '%s\n' "$pkgs" | grep -vx nasm)"; \
+    fi; \
+    dnf -y install --setopt=install_weak_deps=False $pkgs; \
     rm -f /tmp/packages-core.txt; \
     ccache --version; \
     cmake --version; \
